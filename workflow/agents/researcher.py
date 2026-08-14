@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-import contextvars
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from langchain_core.tools import tool
 
 from workflow.agents.evaluator import evaluate_findings
-from workflow.agents.react import run_react
-from workflow.agents.recovery import researcher_fallback
+from workflow.runtime.react import run_react
+from workflow.runtime.recovery import researcher_fallback
 from workflow.config import (
     EVALUATOR_ENABLED,
     EVALUATOR_RETRY,
@@ -21,9 +19,10 @@ from workflow.config import (
 )
 from workflow.prompts import RESEARCHER_SYSTEM
 from workflow.tools import browse_page, report_findings, web_search
+from workflow.util import run_in_threads
 
 
-def _gather_findings(task: str) -> str:
+def _gather_findings(task: str) -> tuple[str, str]:
     result = run_react(
         make_llm(),
         [web_search, browse_page, report_findings],
@@ -38,19 +37,20 @@ def _gather_findings(task: str) -> str:
         stop_tools={"report_findings"},
         indent="  ",
     )
-    if result.payload:
-        return result.payload
-    return researcher_fallback(result.messages, result.stopped_reason or "stopped")
+    text = result.payload or researcher_fallback(
+        result.messages, result.stopped_reason or "stopped"
+    )
+    return text, result.agent_id
 
 
 def run_researcher(task: str, indent: str = "  ", *, allow_retry: bool = True) -> str:
     """Run a researcher, then evaluate the report (optional one retry on FAIL)."""
     del indent  # nesting comes from the live trace tree
-    findings = _gather_findings(task)
+    findings, agent_id = _gather_findings(task)
     if not EVALUATOR_ENABLED:
         return findings
 
-    review = evaluate_findings(task, findings)
+    review = evaluate_findings(task, findings, parent_id=agent_id)
     package = f"{findings.strip()}\n\n---\n\n{review.text}"
     if review.failed and allow_retry and EVALUATOR_RETRY:
         retry_task = (
@@ -59,8 +59,8 @@ def run_researcher(task: str, indent: str = "  ", *, allow_retry: bool = True) -
             "and return better sourced findings:\n"
             f"{review.text}"
         )
-        second = _gather_findings(retry_task)
-        second_review = evaluate_findings(task, second)
+        second, second_id = _gather_findings(retry_task)
+        second_review = evaluate_findings(task, second, parent_id=second_id)
         return (
             f"{second.strip()}\n\n---\n\n{second_review.text}\n\n"
             f"(Retried once after evaluator {review.verdict}.)"
@@ -103,30 +103,19 @@ def run_researchers_parallel(tasks: list[str]) -> str:
     cleaned = _normalize_tasks(tasks)[: max(1, MAX_PARALLEL_RESEARCHERS)]
     if not cleaned:
         return "Error: spawn_researchers requires at least one non-empty task."
-    if len(cleaned) == 1:
-        return run_researcher(cleaned[0])
 
-    results: dict[int, str] = {}
-
-    def _run(index: int, assigned: str) -> tuple[int, str]:
+    def _one(assigned: str) -> str:
         try:
-            return index, run_researcher(assigned)
+            return run_researcher(assigned)
         except Exception as exc:
-            return index, f"Researcher failed: {exc}"
+            return f"Researcher failed: {exc}"
 
-    with ThreadPoolExecutor(max_workers=len(cleaned)) as pool:
-        futures = []
-        for index, assigned in enumerate(cleaned):
-            ctx = contextvars.copy_context()
-            futures.append(pool.submit(ctx.run, _run, index, assigned))
-        for future in as_completed(futures):
-            index, text = future.result()
-            results[index] = text
-
+    bodies = run_in_threads(_one, cleaned)
+    if len(cleaned) == 1:
+        return bodies[0]
     parts = []
-    for index, assigned in enumerate(cleaned):
-        body = results.get(index, "Researcher produced no output.")
-        parts.append(f"### Parallel researcher {index + 1}\n**Task:** {assigned}\n\n{body}")
+    for index, (assigned, body) in enumerate(zip(cleaned, bodies), start=1):
+        parts.append(f"### Parallel researcher {index}\n**Task:** {assigned}\n\n{body}")
     return "\n\n".join(parts)
 
 
@@ -141,10 +130,7 @@ def spawn_researcher(task: str) -> str:
     focused = (task or "").strip()
     if not focused:
         return "Error: spawn_researcher requires a non-empty task."
-    try:
-        return run_researcher(focused)
-    except Exception as exc:
-        return f"Researcher failed: {exc}"
+    return run_researchers_parallel([focused])
 
 
 @tool

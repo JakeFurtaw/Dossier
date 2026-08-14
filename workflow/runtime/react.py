@@ -1,16 +1,9 @@
-"""A small, explicit ReAct loop on top of LangChain ChatOllama + tools.
-
-create_agent / create_react_agent would hide the trace. This runner keeps
-Thought → Action → Observation first-class, stops on named tools, and
-recovers from malformed model output.
-"""
+"""A small, explicit ReAct loop on top of LangChain ChatOllama + tools."""
 
 from __future__ import annotations
 
-import contextvars
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
@@ -18,13 +11,10 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
 
-from workflow.agents.recovery import (
-    compile_researcher_reports,
-    looks_like_answer,
-    planner_fallback_answer,
-)
-from workflow.agents.tracing import TracePrinter
-from workflow.config import LLM_RETRIES
+from workflow.runtime.recovery import compile_researcher_reports, planner_fallback_answer
+from workflow.runtime.tracing import TracePrinter
+from workflow.config import LLM_RETRIES, make_llm
+from workflow.util import message_text, run_in_threads, thought_text
 
 _PARALLEL_TOOLS = {"spawn_researcher", "spawn_researchers"}
 
@@ -37,30 +27,7 @@ class AgentResult:
     iterations: int = 0
     stopped_reason: str = ""
     messages: list[BaseMessage] = field(default_factory=list)
-
-
-def _message_text(message: BaseMessage) -> str:
-    content = getattr(message, "content", "")
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and block.get("type") == "text":
-                parts.append(str(block.get("text") or ""))
-        return "\n".join(p for p in parts if p).strip()
-    return str(content or "").strip()
-
-
-def _thought_text(message: BaseMessage) -> str:
-    extra = getattr(message, "additional_kwargs", None) or {}
-    reasoning = str(extra.get("reasoning_content") or extra.get("reasoning") or "").strip()
-    content = _message_text(message)
-    if reasoning and content:
-        return f"{reasoning}\n\n{content}"
-    return reasoning or content or "(no explicit thought)"
+    agent_id: str = ""
 
 
 def _as_args(raw: Any) -> dict[str, Any]:
@@ -128,7 +95,7 @@ def _tool_calls(message: AIMessage) -> list[dict[str, Any]]:
             calls.append({"name": name, "args": args, "id": str(call_id)})
     if calls:
         return calls
-    return _parse_text_tool_calls(_message_text(message))
+    return _parse_text_tool_calls(message_text(message))
 
 
 def _invoke_tool(tool: BaseTool, args: dict[str, Any]) -> str:
@@ -141,12 +108,6 @@ def _invoke_tool(tool: BaseTool, args: dict[str, Any]) -> str:
     return result if isinstance(result, str) else str(result)
 
 
-def _should_run_parallel(calls: list[dict[str, Any]]) -> bool:
-    if len(calls) < 2:
-        return False
-    return all(call["name"] in _PARALLEL_TOOLS for call in calls)
-
-
 def _invoke_one(call: dict[str, Any], tool_map: dict[str, BaseTool], tracer: TracePrinter) -> str:
     tool = tool_map.get(call["name"])
     if tool is None:
@@ -156,27 +117,15 @@ def _invoke_one(call: dict[str, Any], tool_map: dict[str, BaseTool], tracer: Tra
 
 
 def _invoke_parallel(calls: list[dict[str, Any]], tool_map: dict[str, BaseTool]) -> list[str]:
-    """Run independent spawn_* tool calls at the same time."""
-    observations = [""] * len(calls)
+    names = ", ".join(tool_map)
 
-    def _run(index: int) -> tuple[int, str]:
-        call = calls[index]
+    def _run(call: dict[str, Any]) -> str:
         tool = tool_map.get(call["name"])
         if tool is None:
-            return index, (
-                f"Error: unknown tool '{call['name']}'. Available tools: {', '.join(tool_map)}."
-            )
-        return index, _invoke_tool(tool, call["args"])
+            return f"Error: unknown tool '{call['name']}'. Available tools: {names}."
+        return _invoke_tool(tool, call["args"])
 
-    with ThreadPoolExecutor(max_workers=len(calls)) as pool:
-        futures = []
-        for index in range(len(calls)):
-            ctx = contextvars.copy_context()
-            futures.append(pool.submit(ctx.run, _run, index))
-        for future in as_completed(futures):
-            index, text = future.result()
-            observations[index] = text
-    return observations
+    return run_in_threads(_run, calls)
 
 
 def run_react(
@@ -201,7 +150,7 @@ def run_react(
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_message),
     ]
-    result = AgentResult(messages=messages)
+    result = AgentResult(messages=messages, agent_id=tracer.agent_id)
     empty_actions = 0
     format_failures = 0
 
@@ -220,7 +169,7 @@ def run_react(
                 if format_failures > LLM_RETRIES:
                     result.stopped_reason = f"llm_error: {_friendly_llm_error(exc)}"
                     result.last_text = result.stopped_reason
-                    _salvage_stop(result, messages, stop, user_message)
+                    _salvage_stop(result, messages, stop)
                     return result
                 messages.append(
                     HumanMessage(
@@ -236,22 +185,15 @@ def run_react(
                 response = AIMessage(content=str(response))
 
             messages.append(response)
-            tracer.thought(_thought_text(response))
+            tracer.thought(thought_text(response))
             calls = _tool_calls(response)
 
             if not calls:
                 empty_actions += 1
-                result.last_text = _thought_text(response)
-                # After research is in, a thought-only turn means the model
-                # "answered in prose" instead of calling final_answer. Nudging
-                # usually produces another thought. Force a finish turn instead.
-                if (
-                    "final_answer" in stop
-                    and compile_researcher_reports(messages)
-                    and empty_actions >= 1
-                ):
+                result.last_text = thought_text(response)
+                if "final_answer" in stop and compile_researcher_reports(messages):
                     forced = _try_forced_final_answer(
-                        llm, tool_map, messages, user_message, tracer
+                        tool_map, messages, user_message, tracer
                     )
                     if forced is not None:
                         result.payload = forced
@@ -260,19 +202,16 @@ def run_react(
                         result.last_text = forced
                         return result
                     tracer.note(
-                        "Planner wrote thoughts instead of calling final_answer; "
-                        "using researcher reports."
+                        "Could not synthesize a final answer; using researcher reports."
                     )
-                    _salvage_stop(result, messages, stop, user_message)
+                    _salvage_stop(result, messages, stop)
                     return result
                 if empty_actions >= 2:
                     result.stopped_reason = "no_tool_calls"
                     tracer.note("Stopped: two consecutive responses with no tool call.")
-                    _salvage_stop(result, messages, stop, user_message)
+                    _salvage_stop(result, messages, stop)
                     return result
-                messages.append(
-                    HumanMessage(content=_missing_tool_nudge(stop, result.last_text, names, user_message))
-                )
+                messages.append(HumanMessage(content=_missing_tool_nudge(stop, names)))
                 continue
 
             empty_actions = 0
@@ -280,12 +219,10 @@ def run_react(
             for call in calls:
                 tracer.action(call["name"], call["args"])
 
-            if _should_run_parallel(calls):
+            if len(calls) > 1 and all(call["name"] in _PARALLEL_TOOLS for call in calls):
                 observations = _invoke_parallel(calls, tool_map)
             else:
-                observations = []
-                for call in calls:
-                    observations.append(_invoke_one(call, tool_map, tracer))
+                observations = [_invoke_one(call, tool_map, tracer) for call in calls]
 
             for call, observation in zip(calls, observations):
                 tracer.observation(observation)
@@ -305,7 +242,7 @@ def run_react(
 
         result.stopped_reason = "max_iterations"
         tracer.note(f"Reached max iterations ({max_iterations}).")
-        _salvage_stop(result, messages, stop, user_message)
+        _salvage_stop(result, messages, stop)
         return result
     finally:
         tracer.finish(result.stopped_reason or "stopped")
@@ -327,13 +264,12 @@ def _last_step_nudge(stop: set[str], names: str) -> str:
     return f"This is your last step. Call one of: {names}."
 
 
-def _missing_tool_nudge(stop: set[str], last_text: str, names: str, goal: str = "") -> str:
-    if "final_answer" in stop and looks_like_answer(last_text, goal):
+def _missing_tool_nudge(stop: set[str], names: str) -> str:
+    if "final_answer" in stop:
         return (
-            "You already drafted the answer in text. That does not complete the run. "
-            "Call final_answer now and put that researched answer (not these instructions) "
-            "in the answer argument. Do not spawn another researcher unless a required "
-            "fact is still missing."
+            "Call final_answer now with the researched answer. "
+            "A Thought does not finish the run. Do not spawn another researcher "
+            "unless a required fact is still missing."
         )
     if "report_findings" in stop:
         return (
@@ -344,74 +280,87 @@ def _missing_tool_nudge(stop: set[str], last_text: str, names: str, goal: str = 
     return f"You must call a tool. Available tools: {names}."
 
 
+def _usable_synthesis(text: str) -> bool:
+    """True when the model wrote a user-facing answer, not more planning chatter."""
+    if not text or len(text.strip()) < 200:
+        return False
+    lower = text.lower()
+    if "call final_answer" in lower and "## " not in text and "http" not in lower:
+        return False
+    planning = ("let me compose", "let me structure", "let me write the final", "i'll delegate")
+    if any(marker in lower for marker in planning) and text.count("## ") < 2:
+        return False
+    return True
+
+
+def _commit_final_answer(tool: BaseTool, answer: str, tracer: TracePrinter) -> str | None:
+    tracer.action("final_answer", {"answer": answer})
+    observation = _invoke_tool(tool, {"answer": answer})
+    tracer.observation(observation)
+    if observation and not observation.startswith("Error:"):
+        return observation
+    return None
+
+
 def _try_forced_final_answer(
-    llm: BaseChatModel,
     tool_map: dict[str, BaseTool],
     messages: list[BaseMessage],
     goal: str,
     tracer: TracePrinter,
 ) -> str | None:
-    """One compact retry with only final_answer bound, after a thought-only turn."""
+    """Write the user-facing answer from the reports, then submit final_answer ourselves.
+
+    Ollama ignores tool_choice, and reasoning models often burn the token budget
+    thinking about the call instead of emitting it. A no-tools, no-reasoning
+    write step is much more reliable.
+    """
     tool = tool_map.get("final_answer")
-    if tool is None:
-        return None
     reports = compile_researcher_reports(messages)
-    if not reports:
+    if tool is None or not reports:
         return None
-    tracer.note("Forcing a final_answer tool call (research is done; no tool was called).")
-    compact = reports if len(reports) <= 9000 else reports[:9000] + "\n… [truncated]"
-    forced_llm = llm.bind_tools([tool])
-    forced_messages: list[BaseMessage] = [
+
+    compact = reports if len(reports) <= 12000 else reports[:12000] + "\n… [truncated]"
+    writer = make_llm(reasoning=False, num_predict=2048)
+    prompt = [
         SystemMessage(
             content=(
-                "You are finishing a multi-agent research run. "
-                "You already have researcher reports. "
-                "Call the final_answer tool now with a complete markdown answer. "
-                "Do not write a plan. Do not call any other tool. "
-                "A Thought without a tool call does not finish the run."
+                "You write the final user-facing answer for a research workflow. "
+                "Output ONLY markdown for the user. No plan, no tool talk, no "
+                "'I will now compose'. Start with a heading. Include a direct "
+                "recommendation, benefits and drawbacks for each option, source "
+                "URLs from the evidence, and a short confidence note."
             )
         ),
         HumanMessage(
             content=(
                 f"Original goal:\n{goal.strip()}\n\n"
                 f"Research evidence:\n{compact}\n\n"
-                "Call final_answer now."
+                "Write the complete markdown answer now."
             )
         ),
     ]
+
+    tracer.note("Writing final_answer from researcher reports (no tool call from planner).")
     try:
         with tracer.thinking():
-            response = forced_llm.invoke(forced_messages)
+            response = writer.invoke(prompt)
     except Exception as exc:
-        tracer.note(f"Forced final_answer invoke failed: {exc}")
+        tracer.note(f"Final-answer synthesis failed: {exc}")
         return None
+
     if not isinstance(response, AIMessage):
         response = AIMessage(content=str(response))
-    tracer.thought(_thought_text(response))
-    calls = _tool_calls(response)
-    for call in calls:
-        if call["name"] != "final_answer":
-            continue
-        tracer.action("final_answer", call["args"])
-        observation = _invoke_tool(tool, call["args"])
-        tracer.observation(observation)
-        if observation and not observation.startswith("Error:"):
-            return observation
-    return None
+    prose = message_text(response) or thought_text(response)
+    tracer.thought(prose)
+    if not _usable_synthesis(prose):
+        return None
+    return _commit_final_answer(tool, prose, tracer)
 
 
-def _salvage_stop(
-    result: AgentResult,
-    messages: list[BaseMessage],
-    stop: set[str],
-    goal: str = "",
-) -> None:
-    """Keep a goal-matching draft (or researcher reports), never tool-call meta."""
-    if result.stop_tool or result.payload:
+def _salvage_stop(result: AgentResult, messages: list[BaseMessage], stop: set[str]) -> None:
+    if result.stop_tool or result.payload or "final_answer" not in stop:
         return
-    if "final_answer" not in stop:
-        return
-    draft = planner_fallback_answer(messages, goal)
+    draft = planner_fallback_answer(messages)
     if not draft:
         return
     result.payload = draft

@@ -22,7 +22,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 from rich.tree import Tree
 
-from workflow.agents.report import TraceEvent, write_reports
+from workflow.runtime.report import TraceEvent, write_reports
 from workflow.config import HOST, MODEL, NUM_PREDICT, OBS_TRUNCATE, REPORT_DIR, TEMPERATURE
 
 _current: ContextVar[TraceSession | None] = ContextVar("trace_session", default=None)
@@ -190,15 +190,20 @@ class TraceSession:
             if self.report_path:
                 self.console.print(f"[dim]Saved report:[/] {self.report_path}")
 
-    def start_agent(self, role: str, max_iterations: int = 0) -> str:
+    def start_agent(
+        self,
+        role: str,
+        max_iterations: int = 0,
+        parent_id: str | None = None,
+    ) -> str:
         with self._lock:
             n = self._role_counts.get(role, 0) + 1
             self._role_counts[role] = n
             agent_id = f"{role}-{n}"
             node = AgentNode(agent_id=agent_id, role=role, max_iterations=max_iterations)
             stack = list(_agent_stack.get())
-            parent_id = stack[-1] if stack else None
-            parent = self.nodes.get(parent_id) if parent_id else None
+            attach_to = parent_id or (stack[-1] if stack else None)
+            parent = self.nodes.get(attach_to) if attach_to else None
             if parent:
                 parent.children.append(node)
                 parent.status = "waiting"
@@ -225,13 +230,20 @@ class TraceSession:
             if stack and stack[-1] == agent_id:
                 stack.pop()
                 _agent_stack.set(tuple(stack))
-            parent_id = stack[-1] if stack else None
-            parent = self.nodes.get(parent_id) if parent_id else None
+            parent = self._parent_of(node) if node else None
             if parent and parent.status == "waiting":
-                still_busy = any(child.busy for child in parent.children)
+                still_busy = any(
+                    child.busy for child in parent.children if child.agent_id != agent_id
+                )
                 if not still_busy:
-                    parent.status = "acting"
-                    parent.activity = parent.activity.replace("waiting on ", "resuming after ")
+                    if node and node.role == "evaluator":
+                        parent.status = "done"
+                        parent.activity = f"evaluated {reason}"
+                    else:
+                        parent.status = "acting"
+                        parent.activity = parent.activity.replace(
+                            "waiting on ", "resuming after "
+                        )
         self._emit(
             TraceEvent(kind="finish", role=node.role if node else "", agent_id=agent_id, step=0, text=reason),
             print_panel=False,
@@ -451,11 +463,19 @@ class TraceSession:
 class TracePrinter:
     """Per-agent adapter used by the ReAct loop."""
 
-    def __init__(self, role: str, indent: str = "", max_iterations: int = 0) -> None:
+    def __init__(
+        self,
+        role: str,
+        indent: str = "",
+        max_iterations: int = 0,
+        parent_id: str | None = None,
+    ) -> None:
         self.role = role
         self.indent = indent
         self.session = get_session()
-        self.agent_id = self.session.start_agent(role, max_iterations=max_iterations)
+        self.agent_id = self.session.start_agent(
+            role, max_iterations=max_iterations, parent_id=parent_id
+        )
         self.step = 0
 
     def next_step(self) -> int:

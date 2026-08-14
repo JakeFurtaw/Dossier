@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from workflow.agents.tracing import TracePrinter
+from workflow.runtime.tracing import TracePrinter
 from workflow.config import make_llm
 from workflow.prompts import EVALUATOR_SYSTEM
 
@@ -40,9 +40,9 @@ def parse_verdict(text: str) -> str:
     return "WEAK"
 
 
-def evaluate_findings(task: str, findings: str) -> Evaluation:
+def evaluate_findings(task: str, findings: str, parent_id: str | None = None) -> Evaluation:
     """Score a researcher's report against its assigned task."""
-    printer = TracePrinter("evaluator", max_iterations=1)
+    printer = TracePrinter("evaluator", max_iterations=1, parent_id=parent_id)
     printer.next_step()
     llm = make_llm(reasoning=False, num_predict=600)
     prompt = (

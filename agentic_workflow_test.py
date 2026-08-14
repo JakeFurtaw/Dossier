@@ -11,7 +11,7 @@ How to extend later
 - Swap models: `OLLAMA_MODEL=gemma4:31b python agentic_workflow_test.py`
 - Point at a remote Ollama host: `OLLAMA_HOST=http://host:11434 ...`
 
-This file is the spec entry point. The loop lives in `workflow/agents/react.py`
+This file is the spec entry point. The loop lives in `workflow/runtime/react.py`
 so Thought / Action / Observation stay visible instead of hidden inside a graph.
 """
 
@@ -21,7 +21,7 @@ import argparse
 import sys
 
 from workflow.agents.planner import run_planner
-from workflow.agents.tracing import start_trace
+from workflow.runtime.tracing import start_trace
 from workflow.config import (
     DEFAULT_GOAL,
     HOST,

@@ -1,4 +1,4 @@
-"""Planner and researcher ReAct agents."""
+"""Planner, researcher, and evaluator agents."""
 
 from workflow.agents.planner import run_planner
 

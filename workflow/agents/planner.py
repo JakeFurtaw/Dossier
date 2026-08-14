@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from workflow.agents.react import AgentResult, run_react
+from workflow.runtime.react import AgentResult, run_react
 from workflow.agents.researcher import spawn_researcher, spawn_researchers
 from workflow.config import PLANNER_MAX_ITERS, make_llm
 from workflow.prompts import PLANNER_SYSTEM

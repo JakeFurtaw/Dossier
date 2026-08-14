@@ -1,6 +1,18 @@
-# Agentic Workflow Test Demo
+# Mutli-Agent Workflow Demo
 
 A minimal multi-agent ReAct demo. A **planner** decomposes a goal and can spawn **several researchers in parallel**. Each researcher’s report is checked by an **evaluator** (PASS / WEAK / FAIL) before it returns. The planner then calculates and calls `final_answer`.
+
+## Layout
+
+```
+workflow/
+  agents/          planner, researcher, evaluator
+  runtime/         ReAct loop, tracing, salvage, markdown reports
+  tools/           web_search, browse_page, calculator, stop tools
+  config.py
+  prompts.py
+  util.py
+```
 
 ## Setup
 
