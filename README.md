@@ -32,7 +32,7 @@ Custom goal:
 python agentic_workflow_test.py "What is the population of Porto, Portugal vs a town of 5,000?"
 ```
 
-The terminal shows a **live agent tree** (spinner while Ollama or a tool is running) and colored Thought / Action / Observation panels. Nested researchers are indented under the planner. The final answer is rendered as markdown.
+The terminal stays compact by default: a **live agent tree** plus one-line tool actions (and evaluator verdicts). Thoughts, page extracts, and full tool JSON are **not** printed. The markdown report still has the complete trace. Use `--verbose` for the old full panels.
 
 Each run also writes a report you can reopen later:
 
@@ -41,7 +41,7 @@ runs/YYYYMMDD-HHMMSS.md      # full trace + final answer
 ```
 
 ```bash
-python agentic_workflow_test.py --verbose              # do not truncate thoughts/observations
+python agentic_workflow_test.py --verbose              # full Thought / Action / Observation panels
 python agentic_workflow_test.py --no-save              # skip writing runs/
 python agentic_workflow_test.py --report-dir ./out     # write reports somewhere else
 ```

@@ -42,7 +42,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--verbose",
         action="store_true",
         default=VERBOSE,
-        help="Print full thoughts and observations (default: truncate in the terminal).",
+        help="Print full Thought / Action / Observation panels in the terminal.",
     )
     parser.add_argument(
         "--no-save",

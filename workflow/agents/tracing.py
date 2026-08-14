@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -45,6 +46,29 @@ def _preview(text: str, limit: int, verbose: bool) -> str:
         return text
     hidden = len(text) - limit
     return text[:limit].rstrip() + f"\n… [{hidden} more chars — full text in the run report]"
+
+
+def _one_line(text: str, limit: int = 88) -> str:
+    line = " ".join((text or "").split())
+    if len(line) <= limit:
+        return line
+    return line[: limit - 1] + "…"
+
+
+def _observation_summary(text: str) -> str:
+    match = re.search(r"\*\*Verdict:\*\*\s*(PASS|WEAK|FAIL)", text or "", flags=re.I)
+    if match:
+        return f"evaluator {match.group(1).upper()}"
+    match = re.search(r"Search results for .+ \((\d+) hits\)", text or "")
+    if match:
+        return f"{match.group(1)} search hits"
+    if (text or "").startswith("Blocked:"):
+        return "page blocked"
+    if "Parallel researcher" in (text or ""):
+        n = (text or "").count("### Parallel researcher")
+        return f"{n or 1} parallel report(s)"
+    chars = len(text or "")
+    return f"ok · {chars} chars"
 
 
 def _tool_detail(name: str, args: dict[str, Any]) -> str:
@@ -252,8 +276,11 @@ class TraceSession:
 
     def thought(self, agent_id: str, role: str, step: int, text: str) -> None:
         event = TraceEvent(kind="thought", role=role, agent_id=agent_id, step=step, text=text)
+        if not self.verbose:
+            self._emit(event, print_panel=False)
+            return
         color = _role_color(role)
-        body = Text(_preview(text, OBS_TRUNCATE, self.verbose) or "(no explicit thought)")
+        body = Text(_preview(text, OBS_TRUNCATE, True) or "(no explicit thought)")
         body.stylize("italic dim")
         self._emit(
             event,
@@ -271,6 +298,16 @@ class TraceSession:
             kind="action", role=role, agent_id=agent_id, step=step, tool=name, args=args
         )
         color = _role_color(role)
+        if not self.verbose:
+            detail = _one_line(_tool_detail(name, args))
+            line = Text.assemble(
+                ("  " * self._depth(agent_id)),
+                (f"{agent_id}", color),
+                (f"  {name}  ", "bold yellow"),
+                (detail, "dim"),
+            )
+            self._emit(event, line)
+            return
         title = Text.assemble(
             ("Action", f"bold {color}"),
             (f" · {agent_id} · ", "dim"),
@@ -290,7 +327,19 @@ class TraceSession:
     def observation(self, agent_id: str, role: str, step: int, text: str) -> None:
         event = TraceEvent(kind="observation", role=role, agent_id=agent_id, step=step, text=text)
         color = _role_color(role)
-        preview = _preview(text, OBS_TRUNCATE, self.verbose)
+        if not self.verbose:
+            summary = _observation_summary(text)
+            if summary.startswith("evaluator ") or summary.startswith("page blocked"):
+                line = Text.assemble(
+                    ("  " * self._depth(agent_id)),
+                    (f"{agent_id}  ", color),
+                    (summary, "green" if "PASS" in summary else "yellow"),
+                )
+                self._emit(event, line)
+            else:
+                self._emit(event, print_panel=False)
+            return
+        preview = _preview(text, OBS_TRUNCATE, True)
         self._emit(
             event,
             Panel(
@@ -304,6 +353,12 @@ class TraceSession:
 
     def note(self, agent_id: str, role: str, step: int, text: str) -> None:
         event = TraceEvent(kind="note", role=role, agent_id=agent_id, step=step, text=text)
+        if not self.verbose and text.startswith("Forcing a final_answer"):
+            self._emit(event, Text.from_markup(f"[yellow]{agent_id}[/] {text}"))
+            return
+        if not self.verbose:
+            self._emit(event, print_panel=False)
+            return
         self._emit(
             event,
             Text.from_markup(f"[yellow]{agent_id}[/] {text}"),
