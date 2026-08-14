@@ -7,9 +7,10 @@ import os
 from langchain_ollama import ChatOllama
 
 DEFAULT_GOAL = (
-    "What is the approximate current population of Lisbon, Portugal? "
-    "How many times larger is it than a town of 5,000 people? "
-    "Provide a short summary with sources or estimates and the calculation."
+    "What is the best agent framework to build a new AI Agent on in 2026? "
+    "I am looking at Langchain and Llama Index mainly, but I am open to trying others. "
+    "What are the benefits and drawbacks of each?"
+
 )
 
 
