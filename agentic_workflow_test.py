@@ -21,8 +21,16 @@ import argparse
 import sys
 
 from workflow.agents.planner import run_planner
+from workflow.runtime.citations import (
+    audit_citations,
+    audit_to_markdown,
+    build_evidence_index,
+    summarize_audit,
+)
 from workflow.runtime.tracing import start_trace
 from workflow.config import (
+    CITATION_CHECK,
+    CITATION_STRICT,
     DEFAULT_GOAL,
     HOST,
     MODEL,
@@ -74,8 +82,28 @@ def run(goal: str, *, verbose: bool, save: bool, report_dir: str) -> int:
     ) as session:
         result = run_planner(goal)
         final = result.payload if result.stop_tool == "final_answer" else ""
-        session.complete(final=final, reason=result.stopped_reason)
-        return 0 if final else 1
+        citation_md = ""
+        citation_summary = ""
+        strict_fail = False
+        if final and CITATION_CHECK:
+            audit = audit_citations(
+                final,
+                build_evidence_index(result.messages),
+                stage="final answer",
+                grounding=False,
+            )
+            citation_md = audit_to_markdown(audit)
+            citation_summary = summarize_audit(audit)
+            strict_fail = CITATION_STRICT and not audit.all_verified
+        session.complete(
+            final=final,
+            reason=result.stopped_reason,
+            citation_audit_md=citation_md,
+            citation_summary=citation_summary,
+        )
+        if not final:
+            return 1
+        return 1 if strict_fail else 0
 
 
 def main(argv: list[str] | None = None) -> int:

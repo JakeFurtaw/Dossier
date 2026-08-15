@@ -25,7 +25,7 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-Ollama must be running locally with a tool-capable model. Default: `qwen3.6`.
+Ollama must be running locally with a tool-capable model. Default: `qwen3.8:latest`.
 
 ```bash
 ollama serve          # if it is not already running
@@ -62,18 +62,39 @@ Environment variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OLLAMA_MODEL` | `qwen3.6` | Chat model name |
+| `OLLAMA_MODEL` | `qwen3.8:latest` | Chat model name |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama base URL |
 | `OLLAMA_TEMPERATURE` | `0.2` | Sampling temperature |
 | `OLLAMA_NUM_PREDICT` | `2048` | Max generated tokens |
 | `OLLAMA_REASONING` | `1` | Use the model's thinking stream as Thought |
-| `PLANNER_MAX_ITERS` | `10` | Planner ReAct steps |
+| `PLANNER_MAX_ITERS` | `8` | Planner ReAct steps |
 | `RESEARCHER_MAX_ITERS` | `6` | Researcher ReAct steps |
 | `VERBOSE` | `0` | Same as `--verbose` |
 | `REPORT_DIR` | `runs` | Default report directory |
 | `MAX_PARALLEL_RESEARCHERS` | `3` | Cap on concurrent researcher tasks |
 | `EVALUATOR_ENABLED` | `1` | Run an evaluator after each researcher |
 | `EVALUATOR_RETRY` | `1` | One extra researcher pass if the evaluator says FAIL |
+| `CITATION_CHECK` | `1` | Verify cited URLs against tool output (researcher reports + final answer) |
+| `CITATION_STRICT` | `0` | Exit non-zero if any URL in the final answer is unverified |
+
+## Citation verification
+
+Every run audits where its sources came from — pure string matching, no extra
+model calls, no GPU load:
+
+- each **researcher report** is checked against that researcher's own
+  `web_search` / `browse_page` output. A `**Citation check:** …` line is
+  appended to the report, so the planner and the evaluator both see it.
+- the **final answer** is checked against the researcher reports the planner
+  received. The audit table lands in the run report as
+  `## Citation audit (final answer)`.
+- numbers cited on the same line as a URL are also matched against the
+  observed page text for that URL (researcher level only).
+
+URLs are compared canonically (no `www.`, `old.reddit.com` vs `reddit.com`,
+query/fragment/trailing-slash differences), so formatting drift is not read as
+fabrication. `CITATION_STRICT=1` is meant for CI/evals: a run with unverified
+URLs exits non-zero.
 
 ## Why this is an agentic workflow
 

@@ -33,7 +33,7 @@ HOST = _env_str("OLLAMA_HOST", "http://localhost:11434")
 TEMPERATURE = float(_env_str("OLLAMA_TEMPERATURE", "0.2"))
 NUM_PREDICT = int(_env_str("OLLAMA_NUM_PREDICT", "2048"))
 REASONING = _env_bool("OLLAMA_REASONING", True)
-PLANNER_MAX_ITERS = int(_env_str("PLANNER_MAX_ITERS", "5"))
+PLANNER_MAX_ITERS = int(_env_str("PLANNER_MAX_ITERS", "8"))
 RESEARCHER_MAX_ITERS = int(_env_str("RESEARCHER_MAX_ITERS", "6"))
 OBS_TRUNCATE = int(_env_str("OBS_TRUNCATE", "1500"))
 LLM_RETRIES = int(_env_str("LLM_RETRIES", "2"))
@@ -42,6 +42,8 @@ VERBOSE = _env_bool("VERBOSE", False)
 MAX_PARALLEL_RESEARCHERS = int(_env_str("MAX_PARALLEL_RESEARCHERS", "3"))
 EVALUATOR_ENABLED = _env_bool("EVALUATOR_ENABLED", True)
 EVALUATOR_RETRY = _env_bool("EVALUATOR_RETRY", True)
+CITATION_CHECK = _env_bool("CITATION_CHECK", True)
+CITATION_STRICT = _env_bool("CITATION_STRICT", False)
 
 
 def make_llm(*, reasoning: bool | None = None, num_predict: int | None = None) -> ChatOllama:

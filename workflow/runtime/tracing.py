@@ -133,6 +133,7 @@ class TraceSession:
         self.started = datetime.now().astimezone()
         self.final = ""
         self.reason = ""
+        self.citation_audit_md = ""
         self.report_path: Path | None = None
         self._live: Live | None = None
 
@@ -162,11 +163,27 @@ class TraceSession:
             self._live.stop()
             self._live = None
 
-    def complete(self, *, final: str = "", reason: str = "") -> None:
+    def complete(
+        self,
+        *,
+        final: str = "",
+        reason: str = "",
+        citation_audit_md: str = "",
+        citation_summary: str = "",
+    ) -> None:
         self.final = final or self.final
         self.reason = reason or self.reason
+        self.citation_audit_md = citation_audit_md or self.citation_audit_md
         self._refresh()
         self.stop()
+        if citation_summary:
+            if "unverified:" in citation_summary:
+                style = "yellow"
+            elif "none cited" in citation_summary:
+                style = "dim"
+            else:
+                style = "green"
+            self.console.print(Text(f"[{style}]{citation_summary}[/{style}]"))
         if self.final:
             self.console.print()
             self.console.print(
@@ -457,6 +474,7 @@ class TraceSession:
             reason=self.reason,
             started=self.started,
             ended=ended,
+            citation_audit_md=self.citation_audit_md,
         )
 
 

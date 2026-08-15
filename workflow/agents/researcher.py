@@ -5,12 +5,15 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from langchain_core.messages import BaseMessage
 from langchain_core.tools import tool
 
 from workflow.agents.evaluator import evaluate_findings
+from workflow.runtime.citations import build_evidence_index, citation_check_line
 from workflow.runtime.react import run_react
 from workflow.runtime.recovery import researcher_fallback
 from workflow.config import (
+    CITATION_CHECK,
     EVALUATOR_ENABLED,
     EVALUATOR_RETRY,
     MAX_PARALLEL_RESEARCHERS,
@@ -22,7 +25,7 @@ from workflow.tools import browse_page, report_findings, web_search
 from workflow.util import run_in_threads
 
 
-def _gather_findings(task: str) -> tuple[str, str]:
+def _gather_findings(task: str) -> tuple[str, str, list[BaseMessage]]:
     result = run_react(
         make_llm(),
         [web_search, browse_page, report_findings],
@@ -40,13 +43,23 @@ def _gather_findings(task: str) -> tuple[str, str]:
     text = result.payload or researcher_fallback(
         result.messages, result.stopped_reason or "stopped"
     )
-    return text, result.agent_id
+    return text, result.agent_id, result.messages
+
+
+def _with_citation_check(text: str, messages: list[BaseMessage]) -> str:
+    """Append a deterministic citation verdict, checked against this
+    researcher's own tool output (no extra model calls)."""
+    if not CITATION_CHECK or not text.strip():
+        return text
+    line = citation_check_line(text, build_evidence_index(messages))
+    return f"{text.strip()}\n\n{line}"
 
 
 def run_researcher(task: str, indent: str = "  ", *, allow_retry: bool = True) -> str:
     """Run a researcher, then evaluate the report (optional one retry on FAIL)."""
     del indent  # nesting comes from the live trace tree
-    findings, agent_id = _gather_findings(task)
+    findings, agent_id, messages = _gather_findings(task)
+    findings = _with_citation_check(findings, messages)
     if not EVALUATOR_ENABLED:
         return findings
 
@@ -59,7 +72,8 @@ def run_researcher(task: str, indent: str = "  ", *, allow_retry: bool = True) -
             "and return better sourced findings:\n"
             f"{review.text}"
         )
-        second, second_id = _gather_findings(retry_task)
+        second, second_id, second_messages = _gather_findings(retry_task)
+        second = _with_citation_check(second, second_messages)
         second_review = evaluate_findings(task, second, parent_id=second_id)
         return (
             f"{second.strip()}\n\n---\n\n{second_review.text}\n\n"

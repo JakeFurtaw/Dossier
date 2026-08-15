@@ -38,6 +38,7 @@ def events_to_markdown(
     reason: str,
     started: datetime,
     ended: datetime,
+    citation_audit_md: str = "",
 ) -> str:
     duration = max((ended - started).total_seconds(), 0.0)
     lines = [
@@ -90,6 +91,9 @@ def events_to_markdown(
         elif event.kind == "finish":
             lines.extend([f"**Finished** `{event.agent_id}` ({event.text})", ""])
 
+    if citation_audit_md.strip():
+        lines.extend(["## Citation audit (final answer)", "", citation_audit_md.strip(), ""])
+
     lines.extend(["## Final answer", "", final.strip() or "_(no final_answer)_", ""])
     return "\n".join(lines)
 
@@ -105,6 +109,7 @@ def write_reports(
     reason: str,
     started: datetime,
     ended: datetime,
+    citation_audit_md: str = "",
 ) -> Path:
     report_dir.mkdir(parents=True, exist_ok=True)
     md_path = report_dir / f"{stem}.md"
@@ -117,6 +122,7 @@ def write_reports(
             reason=reason,
             started=started,
             ended=ended,
+            citation_audit_md=citation_audit_md,
         ),
         encoding="utf-8",
     )
