@@ -25,6 +25,12 @@ _UNARY_OPS = {
 }
 
 
+def evaluate_expression(expression: str) -> Number:
+    """Parse and evaluate a restricted arithmetic expression."""
+    tree = ast.parse(expression, mode="eval")
+    return _eval_node(tree)
+
+
 def _eval_node(node: ast.AST) -> Number:
     if isinstance(node, ast.Expression):
         return _eval_node(node.body)
@@ -54,8 +60,7 @@ def calculator(expression: str) -> str:
     if not text:
         return "Error: calculator requires a non-empty expression."
     try:
-        tree = ast.parse(text, mode="eval")
-        result = _eval_node(tree)
+        result = evaluate_expression(text)
     except ZeroDivisionError as exc:
         return f"Error: {exc}"
     except Exception as exc:

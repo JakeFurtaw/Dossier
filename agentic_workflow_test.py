@@ -9,7 +9,9 @@ How to extend later
 - Add a real tool: implement a function in `workflow/tools/`, decorate it with
   `@tool`, and attach it to the planner or researcher tool list.
 - Swap models: `OLLAMA_MODEL=gemma4:31b python agentic_workflow_test.py`
+- Per-role models: `OLLAMA_MODEL_EVALUATOR=qwen2.5:3b ...`
 - Point at a remote Ollama host: `OLLAMA_HOST=http://host:11434 ...`
+- Replay a saved run: `python agentic_workflow_test.py --replay runs/foo.md`
 
 This file is the spec entry point. The loop lives in `workflow/runtime/react.py`
 so Thought / Action / Observation stay visible instead of hidden inside a graph.
@@ -27,6 +29,7 @@ from workflow.runtime.citations import (
     build_evidence_index,
     summarize_audit,
 )
+from workflow.runtime.replay import replay_from_path
 from workflow.runtime.tracing import start_trace
 from workflow.config import (
     CITATION_CHECK,
@@ -34,6 +37,9 @@ from workflow.config import (
     DEFAULT_GOAL,
     HOST,
     MODEL,
+    MODEL_EVALUATOR,
+    MODEL_PLANNER,
+    MODEL_RESEARCHER,
     NUM_PREDICT,
     PLANNER_MAX_ITERS,
     REPORT_DIR,
@@ -62,12 +68,25 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=REPORT_DIR,
         help=f"Directory for run reports (default: {REPORT_DIR}).",
     )
+    parser.add_argument(
+        "--replay",
+        metavar="PATH",
+        help="Replay a saved runs/*.md file without calling the LLM.",
+    )
+    parser.add_argument(
+        "--reaudit",
+        action="store_true",
+        help="With --replay, re-run citation audit on the saved final answer.",
+    )
     return parser.parse_args(argv)
 
 
 def run(goal: str, *, verbose: bool, save: bool, report_dir: str) -> int:
     config = {
         "model": MODEL,
+        "model_planner": MODEL_PLANNER,
+        "model_researcher": MODEL_RESEARCHER,
+        "model_evaluator": MODEL_EVALUATOR,
         "host": HOST,
         "temperature": TEMPERATURE,
         "num_predict": NUM_PREDICT,
@@ -108,6 +127,15 @@ def run(goal: str, *, verbose: bool, save: bool, report_dir: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
+    if args.replay:
+        replay_from_path(
+            args.replay,
+            verbose=args.verbose,
+            reaudit=args.reaudit,
+            save=not args.no_save and args.reaudit,
+            report_dir=args.report_dir,
+        )
+        return 0
     goal = " ".join(args.goal).strip() if args.goal else DEFAULT_GOAL
     return run(goal, verbose=args.verbose, save=not args.no_save, report_dir=args.report_dir)
 

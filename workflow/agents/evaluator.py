@@ -44,7 +44,7 @@ def evaluate_findings(task: str, findings: str, parent_id: str | None = None) ->
     """Score a researcher's report against its assigned task."""
     printer = TracePrinter("evaluator", max_iterations=1, parent_id=parent_id)
     printer.next_step()
-    llm = make_llm(reasoning=False, num_predict=600)
+    llm = make_llm(role="evaluator", reasoning=False, num_predict=600)
     prompt = (
         f"Assigned task:\n{task.strip()}\n\n"
         f"Findings to evaluate:\n{findings.strip() or '(empty)'}"

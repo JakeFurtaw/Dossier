@@ -3,6 +3,10 @@
 Extracted from backend.py (DDGS + Playwright + Trafilatura) so this demo does
 not import the FastAPI / Nemotron stack. Search is cheap (snippets only);
 browse_page does the expensive full-page extract.
+
+One Chromium instance is launched per run (``BrowserPool``) and pages are
+opened against it. Thread-safe in-run URL and search caches on the
+``TraceBus`` deduplicate parallel researchers hitting the same query or page.
 """
 
 from __future__ import annotations
@@ -10,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import threading
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -37,6 +43,108 @@ class WebConfig:
 
 
 web_config = WebConfig()
+
+_browser_pool: ContextVar[BrowserPool | None] = ContextVar("browser_pool", default=None)
+
+
+class BrowserPool:
+    """One headless Chromium per run, owned by a dedicated asyncio thread.
+
+    Playwright objects are bound to the event loop that created them, and
+    researchers run in worker threads. Every ``fetch_page`` is scheduled onto
+    this loop so pages share a single browser instead of launching Chromium
+    per call.
+    """
+
+    def __init__(self) -> None:
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._playwright: Any = None
+        self._browser: Any = None
+        self._ready = threading.Event()
+        self._error: BaseException | None = None
+        self._closed = False
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._main, name="browser-pool", daemon=True)
+        self._thread.start()
+        if not self._ready.wait(timeout=45):
+            raise TimeoutError("Chromium did not start within 45s")
+        if self._error is not None:
+            raise self._error
+
+    def _main(self) -> None:
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._launch())
+        except BaseException as exc:
+            self._error = exc
+            self._ready.set()
+            return
+        self._ready.set()
+        loop.run_forever()
+        loop.run_until_complete(self._shutdown())
+        loop.close()
+
+    async def _launch(self) -> None:
+        self._playwright = await pwa.async_playwright().start()
+        self._browser = await self._playwright.chromium.launch(headless=True)
+
+    async def _shutdown(self) -> None:
+        if self._browser is not None:
+            try:
+                await self._browser.close()
+            except Exception:
+                logger.debug("browser close failed", exc_info=True)
+            self._browser = None
+        if self._playwright is not None:
+            try:
+                await self._playwright.stop()
+            except Exception:
+                logger.debug("playwright stop failed", exc_info=True)
+            self._playwright = None
+
+    def fetch(
+        self,
+        url: str,
+        *,
+        max_chars: int | None = None,
+        timeout: int | None = None,
+        wait_until: str | None = None,
+    ) -> str:
+        if self._loop is None or self._browser is None:
+            raise RuntimeError("BrowserPool is not running")
+        future = asyncio.run_coroutine_threadsafe(
+            fetch_page(
+                url,
+                max_chars=max_chars,
+                timeout=timeout,
+                browser=self._browser,
+                wait_until=wait_until,
+            ),
+            self._loop,
+        )
+        return future.result()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        if self._thread is not None:
+            self._thread.join(timeout=15)
+
+
+def get_browser_pool() -> BrowserPool | None:
+    return _browser_pool.get()
+
+
+def set_browser_pool(pool: BrowserPool | None):
+    return _browser_pool.set(pool)
 
 
 def _run_async(coro):
@@ -224,32 +332,13 @@ async def fetch_page(
             await playwright.stop()
 
 
-@tool
-def web_search(query: str, max_results: int = 5) -> str:
-    """Search the web for current or external facts.
-
-    Use for news, populations, events, and anything that could be stale.
-    Returns titles, URLs, and snippets. After results, browse_page the 1–2
-    most relevant URLs if the snippets are truncated or too shallow.
-    One well-chosen search is enough unless it missed the entity.
-    """
-    q = (query or "").strip()
-    if not q:
-        return "Error: web_search requires a non-empty query."
-
-    n = max(1, min(int(max_results or 5), 8))
-    try:
-        rows = sync_search(q, max_results=n)
-    except Exception as exc:
-        return f"Search failed: {exc}. Try a different query."
-
+def _format_search_results(query: str, rows: list[dict]) -> str:
     if not rows:
         return (
-            f'No search results found for "{q}". '
+            f'No search results found for "{query}". '
             "Try a different, more specific or simpler query."
         )
-
-    lines = [f'Search results for "{q}" ({len(rows)} hits):', ""]
+    lines = [f'Search results for "{query}" ({len(rows)} hits):', ""]
     for i, row in enumerate(rows, start=1):
         title = (row.get("title") or "").strip() or "(untitled)"
         url = _result_url(row)
@@ -267,6 +356,66 @@ def web_search(query: str, max_results: int = 5) -> str:
     return "\n".join(lines)
 
 
+def _run_search(query: str, max_results: int) -> str:
+    try:
+        rows = sync_search(query, max_results=max_results)
+    except Exception as exc:
+        return f"Search failed: {exc}. Try a different query."
+    return _format_search_results(query, rows)
+
+
+@tool
+def web_search(query: str, max_results: int = 5) -> str:
+    """Search the web for current or external facts.
+
+    Use for news, populations, events, and anything that could be stale.
+    Returns titles, URLs, and snippets. After results, browse_page the 1–2
+    most relevant URLs if the snippets are truncated or too shallow.
+    One well-chosen search is enough unless it missed the entity.
+    """
+    q = (query or "").strip()
+    if not q:
+        return "Error: web_search requires a non-empty query."
+
+    n = max(1, min(int(max_results or 5), 8))
+    bus = _trace_bus()
+    if bus is None:
+        return _run_search(q, n)
+
+    cached = bus.get_cached_search(q, n)
+    if cached is not None:
+        from workflow.runtime.metrics import record
+
+        record("search_cache_hit")
+        return cached
+
+    owned = bus.acquire_search(q, n)
+    if not owned:
+        bus.wait_search(q, n)
+        cached = bus.get_cached_search(q, n)
+        if cached is not None:
+            from workflow.runtime.metrics import record
+
+            record("search_cache_hit")
+            return cached
+        return _run_search(q, n)
+
+    try:
+        cached = bus.get_cached_search(q, n)
+        if cached is not None:
+            from workflow.runtime.metrics import record
+
+            record("search_cache_hit")
+            return cached
+        result = _run_search(q, n)
+        bus.put_cached_search(q, n, result)
+        if not result.startswith(("Error:", "Search failed:")):
+            _publish_search(bus, q, result)
+        return result
+    finally:
+        bus.release_search(q, n)
+
+
 @tool
 def browse_page(url: str, instructions: str = "") -> str:
     """Fetch the full, clean content of ONE specific webpage.
@@ -279,18 +428,122 @@ def browse_page(url: str, instructions: str = "") -> str:
     if not target.startswith(("http://", "https://")):
         return "Error: browse_page requires a valid full http(s) URL."
 
+    cached = _cache_get(target)
+    if cached is not None:
+        from workflow.runtime.metrics import record
+
+        record("url_cache_hit")
+        return _with_focus(cached, instructions)
+
+    bus = _trace_bus()
+    owned = bus.acquire_url_fetch(target) if bus is not None else True
+    if bus is not None and not owned:
+        bus.wait_url_fetch(target)
+        cached = _cache_get(target)
+        if cached is not None:
+            from workflow.runtime.metrics import record
+
+            record("url_cache_hit")
+            return _with_focus(cached, instructions)
+
     try:
-        content = _run_async(
-            fetch_page(target, max_chars=web_config.max_chars_per_page, timeout=45)
-        )
+        content = _fetch_page_sync(target)
     except Exception as exc:
+        if bus is not None and owned:
+            bus.release_url_fetch(target)
         return f"Failed to load page at {target}: {exc}"
 
-    blocked = _blocked_page_message(target, content)
-    if blocked:
-        return blocked
+    try:
+        blocked = _blocked_page_message(target, content)
+        if blocked:
+            from workflow.runtime.metrics import record
 
+            record("blocked_page")
+            _cache_put(target, blocked)
+            _publish_browse(bus, target, blocked=True)
+            return blocked
+
+        _cache_put(target, content)
+        _publish_browse(bus, target, blocked=False)
+        return _with_focus(content, instructions)
+    finally:
+        if bus is not None and owned:
+            bus.release_url_fetch(target)
+
+
+def _fetch_page_sync(url: str) -> str:
+    pool = get_browser_pool()
+    if pool is not None:
+        return pool.fetch(url, max_chars=web_config.max_chars_per_page, timeout=45)
+    return _run_async(
+        fetch_page(url, max_chars=web_config.max_chars_per_page, timeout=45)
+    )
+
+
+def _with_focus(content: str, instructions: str) -> str:
     focus = (instructions or "").strip()
     if focus:
         return f"Focus requested: {focus}\n\n{content}"
     return content
+
+
+def _cache_get(url: str) -> str | None:
+    bus = _trace_bus()
+    if bus is None:
+        return None
+    return bus.get_cached_url(url)
+
+
+def _cache_put(url: str, content: str) -> None:
+    bus = _trace_bus()
+    if bus is None:
+        return
+    bus.put_cached_url(url, content)
+
+
+def _publish_search(bus, query: str, result: str) -> None:
+    from workflow.runtime.citations import extract_urls
+    from workflow.runtime.ledger import LedgerEntry
+    from workflow.runtime.tracing import current_agent
+
+    agent_id, role = current_agent()
+    bus.publish_entry(
+        LedgerEntry(
+            role=role or "researcher",
+            agent_id=agent_id,
+            kind="search",
+            title=query,
+            queries=[query],
+            urls=extract_urls(result),
+        )
+    )
+
+
+def _publish_browse(bus, url: str, *, blocked: bool) -> None:
+    if bus is None:
+        return
+    from workflow.runtime.ledger import LedgerEntry
+    from workflow.runtime.tracing import current_agent
+
+    agent_id, role = current_agent()
+    title = f"blocked {url}" if blocked else url
+    bus.publish_entry(
+        LedgerEntry(
+            role=role or "researcher",
+            agent_id=agent_id,
+            kind="browse",
+            title=title,
+            urls=[url],
+        )
+    )
+
+
+def _trace_bus():
+    # Lazy import: start_trace owns the pool and would otherwise cycle with this module.
+    # Read the ContextVar directly so we do not create the process-wide fallback bus.
+    try:
+        from workflow.runtime.tracing import try_get_bus
+
+        return try_get_bus()
+    except Exception:
+        return None

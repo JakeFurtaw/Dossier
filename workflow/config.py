@@ -28,7 +28,10 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
-MODEL = _env_str("OLLAMA_MODEL", "qwen3.8:latest").strip()
+MODEL = _env_str("OLLAMA_MODEL", "qwen3.8:latest")
+MODEL_PLANNER = _env_str("OLLAMA_MODEL_PLANNER", "") or MODEL
+MODEL_RESEARCHER = _env_str("OLLAMA_MODEL_RESEARCHER", "") or MODEL
+MODEL_EVALUATOR = _env_str("OLLAMA_MODEL_EVALUATOR", "") or MODEL
 HOST = _env_str("OLLAMA_HOST", "http://localhost:11434")
 TEMPERATURE = float(_env_str("OLLAMA_TEMPERATURE", "0.2"))
 NUM_PREDICT = int(_env_str("OLLAMA_NUM_PREDICT", "2048"))
@@ -45,11 +48,29 @@ EVALUATOR_RETRY = _env_bool("EVALUATOR_RETRY", True)
 CITATION_CHECK = _env_bool("CITATION_CHECK", True)
 CITATION_STRICT = _env_bool("CITATION_STRICT", False)
 
+_ROLE_MODELS = {
+    "planner": MODEL_PLANNER,
+    "researcher": MODEL_RESEARCHER,
+    "evaluator": MODEL_EVALUATOR,
+}
 
-def make_llm(*, reasoning: bool | None = None, num_predict: int | None = None) -> ChatOllama:
-    """Build the shared Ollama chat model used by planner, researchers, and evaluator."""
+
+def model_for(role: str | None = None) -> str:
+    """Resolve the Ollama model tag for a role, falling back to OLLAMA_MODEL."""
+    if role and role in _ROLE_MODELS:
+        return _ROLE_MODELS[role].strip()
+    return MODEL.strip()
+
+
+def make_llm(
+    *,
+    role: str | None = None,
+    reasoning: bool | None = None,
+    num_predict: int | None = None,
+) -> ChatOllama:
+    """Build an Ollama chat model. ``role`` selects OLLAMA_MODEL_<ROLE> when set."""
     return ChatOllama(
-        model=MODEL.strip(),
+        model=model_for(role),
         base_url=HOST,
         temperature=TEMPERATURE,
         num_predict=NUM_PREDICT if num_predict is None else num_predict,

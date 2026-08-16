@@ -7,11 +7,12 @@ A minimal multi-agent ReAct demo. A **planner** decomposes a goal and can spawn 
 ```
 workflow/
   agents/          planner, researcher, evaluator
-  runtime/         ReAct loop, tracing, salvage, markdown reports
+  runtime/         ReAct loop, TraceBus, salvage chain, markdown reports
   tools/           web_search, browse_page, calculator, stop tools
   config.py
   prompts.py
   util.py
+tests/             pytest for citations, calc, recovery, replay, …
 ```
 
 ## Setup
@@ -56,13 +57,26 @@ runs/YYYYMMDD-HHMMSS.md      # full trace + final answer
 python agentic_workflow_test.py --verbose              # full Thought / Action / Observation panels
 python agentic_workflow_test.py --no-save              # skip writing runs/
 python agentic_workflow_test.py --report-dir ./out     # write reports somewhere else
+python agentic_workflow_test.py --replay runs/foo.md   # re-render a saved run (no LLM)
+python agentic_workflow_test.py --replay runs/foo.md --reaudit
+```
+
+`--replay` reconstructs the event tree from a saved markdown report and
+re-renders it. `--reaudit` also runs the current citation checker against
+the saved final answer (useful after changing `citations.py`).
+
+```bash
+pytest
 ```
 
 Environment variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OLLAMA_MODEL` | `qwen3.8:latest` | Chat model name |
+| `OLLAMA_MODEL` | `qwen3.8:latest` | Default chat model (all roles) |
+| `OLLAMA_MODEL_PLANNER` | `$OLLAMA_MODEL` | Planner / final-answer synthesis |
+| `OLLAMA_MODEL_RESEARCHER` | `$OLLAMA_MODEL` | Researcher sub-agents |
+| `OLLAMA_MODEL_EVALUATOR` | `$OLLAMA_MODEL` | PASS / WEAK / FAIL judge |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama base URL |
 | `OLLAMA_TEMPERATURE` | `0.2` | Sampling temperature |
 | `OLLAMA_NUM_PREDICT` | `2048` | Max generated tokens |
@@ -76,6 +90,17 @@ Environment variables:
 | `EVALUATOR_RETRY` | `1` | One extra researcher pass if the evaluator says FAIL |
 | `CITATION_CHECK` | `1` | Verify cited URLs against tool output (researcher reports + final answer) |
 | `CITATION_STRICT` | `0` | Exit non-zero if any URL in the final answer is unverified |
+
+## Shared context
+
+Researchers in the same run share a compact ledger (queries already issued,
+URLs already opened, and a short summary of each finished report). Later
+researchers — retries and a second spawn — see that digest in their prompt
+and are told not to repeat that work. `web_search` is also cached per run
+(same idea as the page cache), so two parallel researchers who pick the same
+query only hit the network once.
+
+The ledger is written into the run report as `## Shared context`.
 
 ## Citation verification
 

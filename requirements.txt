@@ -6,3 +6,4 @@ ddgs
 trafilatura
 playwright
 rich
+pytest>=8

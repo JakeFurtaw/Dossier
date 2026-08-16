@@ -78,6 +78,10 @@ Rules:
    way to finish. Writing a summary in a Thought does not return anything to
    the planner.
 7. On your last step you MUST call report_findings with everything gathered.
+8. If you are given notes from other researchers, treat their sourced facts
+   as already gathered. Do not repeat their queries or URLs. Only search for
+   what your assigned task still needs. You may cite their URLs when they
+   answer part of your task.
 
 report_findings should include:
 - the facts and numbers you found

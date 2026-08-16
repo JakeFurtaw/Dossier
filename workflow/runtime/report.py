@@ -39,6 +39,8 @@ def events_to_markdown(
     started: datetime,
     ended: datetime,
     citation_audit_md: str = "",
+    counters: dict[str, int] | None = None,
+    shared_context_md: str = "",
 ) -> str:
     duration = max((ended - started).total_seconds(), 0.0)
     lines = [
@@ -49,14 +51,27 @@ def events_to_markdown(
         f"- **Model:** {config.get('model', '')}",
         f"- **Host:** {config.get('host', '')}",
         f"- **Status:** {reason or 'unknown'}",
-        "",
-        "## Goal",
-        "",
-        goal.strip() or "(none)",
-        "",
-        "## Trace",
-        "",
     ]
+    role_models = {
+        "planner": config.get("model_planner"),
+        "researcher": config.get("model_researcher"),
+        "evaluator": config.get("model_evaluator"),
+    }
+    default_model = config.get("model", "")
+    if any(value and value != default_model for value in role_models.values()):
+        parts = [f"{role}={name}" for role, name in role_models.items() if name]
+        lines.append(f"- **Models:** {', '.join(parts)}")
+    lines.extend(
+        [
+            "",
+            "## Goal",
+            "",
+            goal.strip() or "(none)",
+            "",
+            "## Trace",
+            "",
+        ]
+    )
 
     last_heading = ""
     for event in events:
@@ -91,8 +106,20 @@ def events_to_markdown(
         elif event.kind == "finish":
             lines.extend([f"**Finished** `{event.agent_id}` ({event.text})", ""])
 
+    if shared_context_md.strip():
+        block = shared_context_md.strip()
+        if not block.startswith("## "):
+            block = "## Shared context\n\n" + block
+        lines.extend([block, ""])
+
     if citation_audit_md.strip():
         lines.extend(["## Citation audit (final answer)", "", citation_audit_md.strip(), ""])
+
+    if counters:
+        lines.extend(["## Defensive counters", ""])
+        for name, count in sorted(counters.items()):
+            lines.append(f"- `{name}`: {count}")
+        lines.append("")
 
     lines.extend(["## Final answer", "", final.strip() or "_(no final_answer)_", ""])
     return "\n".join(lines)
@@ -110,6 +137,8 @@ def write_reports(
     started: datetime,
     ended: datetime,
     citation_audit_md: str = "",
+    counters: dict[str, int] | None = None,
+    shared_context_md: str = "",
 ) -> Path:
     report_dir.mkdir(parents=True, exist_ok=True)
     md_path = report_dir / f"{stem}.md"
@@ -123,6 +152,8 @@ def write_reports(
             started=started,
             ended=ended,
             citation_audit_md=citation_audit_md,
+            counters=counters,
+            shared_context_md=shared_context_md,
         ),
         encoding="utf-8",
     )

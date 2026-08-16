@@ -11,9 +11,14 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
 
-from workflow.runtime.recovery import compile_researcher_reports, planner_fallback_answer
+from workflow.runtime.metrics import record
+from workflow.runtime.recovery import (
+    FallbackContext,
+    run_fallback_chain,
+    should_fallback_early,
+)
 from workflow.runtime.tracing import TracePrinter
-from workflow.config import LLM_RETRIES, make_llm
+from workflow.config import LLM_RETRIES
 from workflow.util import message_text, run_in_threads, thought_text
 
 _PARALLEL_TOOLS = {"spawn_researcher", "spawn_researchers"}
@@ -95,7 +100,10 @@ def _tool_calls(message: AIMessage) -> list[dict[str, Any]]:
             calls.append({"name": name, "args": args, "id": str(call_id)})
     if calls:
         return calls
-    return _parse_text_tool_calls(message_text(message))
+    parsed = _parse_text_tool_calls(message_text(message))
+    if parsed:
+        record("parse_text_tool_calls")
+    return parsed
 
 
 def _invoke_tool(tool: BaseTool, args: dict[str, Any]) -> str:
@@ -159,6 +167,7 @@ def run_react(
             result.iterations = iteration
             tracer.next_step()
             if iteration == max_iterations:
+                record("last_step_nudge")
                 messages.append(HumanMessage(content=_last_step_nudge(stop, names)))
             try:
                 with tracer.thinking():
@@ -169,7 +178,15 @@ def run_react(
                 if format_failures > LLM_RETRIES:
                     result.stopped_reason = f"llm_error: {_friendly_llm_error(exc)}"
                     result.last_text = result.stopped_reason
-                    _salvage_stop(result, messages, stop)
+                    apply_stop_fallback(
+                        result,
+                        messages,
+                        stop,
+                        role=role,
+                        goal=user_message,
+                        tool_map=tool_map,
+                        tracer=tracer,
+                    )
                     return result
                 messages.append(
                     HumanMessage(
@@ -191,26 +208,32 @@ def run_react(
             if not calls:
                 empty_actions += 1
                 result.last_text = thought_text(response)
-                if "final_answer" in stop and compile_researcher_reports(messages):
-                    forced = _try_forced_final_answer(
-                        tool_map, messages, user_message, tracer
+                if should_fallback_early(role, stop, messages):
+                    result.stopped_reason = result.stopped_reason or "no_tool_calls"
+                    apply_stop_fallback(
+                        result,
+                        messages,
+                        stop,
+                        role=role,
+                        goal=user_message,
+                        tool_map=tool_map,
+                        tracer=tracer,
                     )
-                    if forced is not None:
-                        result.payload = forced
-                        result.stop_tool = "final_answer"
-                        result.stopped_reason = "stop_tool"
-                        result.last_text = forced
-                        return result
-                    tracer.note(
-                        "Could not synthesize a final answer; using researcher reports."
-                    )
-                    _salvage_stop(result, messages, stop)
                     return result
                 if empty_actions >= 2:
                     result.stopped_reason = "no_tool_calls"
                     tracer.note("Stopped: two consecutive responses with no tool call.")
-                    _salvage_stop(result, messages, stop)
+                    apply_stop_fallback(
+                        result,
+                        messages,
+                        stop,
+                        role=role,
+                        goal=user_message,
+                        tool_map=tool_map,
+                        tracer=tracer,
+                    )
                     return result
+                record("missing_tool_nudge")
                 messages.append(HumanMessage(content=_missing_tool_nudge(stop, names)))
                 continue
 
@@ -242,10 +265,57 @@ def run_react(
 
         result.stopped_reason = "max_iterations"
         tracer.note(f"Reached max iterations ({max_iterations}).")
-        _salvage_stop(result, messages, stop)
+        apply_stop_fallback(
+            result,
+            messages,
+            stop,
+            role=role,
+            goal=user_message,
+            tool_map=tool_map,
+            tracer=tracer,
+        )
         return result
     finally:
         tracer.finish(result.stopped_reason or "stopped")
+
+
+def apply_stop_fallback(
+    result: AgentResult,
+    messages: list[BaseMessage],
+    stop: set[str],
+    *,
+    role: str,
+    goal: str = "",
+    tool_map: dict[str, Any] | None = None,
+    tracer: TracePrinter | None = None,
+) -> bool:
+    """Run the role's fallback chain and copy any payload onto ``result``.
+
+    Defined here (and re-exported from recovery conceptually) so AgentResult
+    stays local. Thin wrapper around ``run_fallback_chain``.
+    """
+    if result.stop_tool or result.payload:
+        return False
+    ctx = FallbackContext(
+        role=role,
+        stop_tools=set(stop),
+        messages=messages,
+        stopped_reason=result.stopped_reason,
+        goal=goal,
+        tool_map=tool_map or {},
+        tracer=tracer,
+    )
+    outcome = run_fallback_chain(ctx)
+    if outcome is None:
+        return False
+    if outcome.payload:
+        result.payload = outcome.payload
+        result.last_text = outcome.payload
+    if outcome.stop_tool:
+        result.stop_tool = outcome.stop_tool
+    if outcome.stopped_reason:
+        result.stopped_reason = outcome.stopped_reason
+    return bool(outcome.payload)
 
 
 def _last_step_nudge(stop: set[str], names: str) -> str:
@@ -278,95 +348,6 @@ def _missing_tool_nudge(stop: set[str], names: str) -> str:
             "unless you have zero usable facts."
         )
     return f"You must call a tool. Available tools: {names}."
-
-
-def _usable_synthesis(text: str) -> bool:
-    """True when the model wrote a user-facing answer, not more planning chatter."""
-    if not text or len(text.strip()) < 200:
-        return False
-    lower = text.lower()
-    if "call final_answer" in lower and "## " not in text and "http" not in lower:
-        return False
-    planning = ("let me compose", "let me structure", "let me write the final", "i'll delegate")
-    if any(marker in lower for marker in planning) and text.count("## ") < 2:
-        return False
-    return True
-
-
-def _commit_final_answer(tool: BaseTool, answer: str, tracer: TracePrinter) -> str | None:
-    tracer.action("final_answer", {"answer": answer})
-    observation = _invoke_tool(tool, {"answer": answer})
-    tracer.observation(observation)
-    if observation and not observation.startswith("Error:"):
-        return observation
-    return None
-
-
-def _try_forced_final_answer(
-    tool_map: dict[str, BaseTool],
-    messages: list[BaseMessage],
-    goal: str,
-    tracer: TracePrinter,
-) -> str | None:
-    """Write the user-facing answer from the reports, then submit final_answer ourselves.
-
-    Ollama ignores tool_choice, and reasoning models often burn the token budget
-    thinking about the call instead of emitting it. A no-tools, no-reasoning
-    write step is much more reliable.
-    """
-    tool = tool_map.get("final_answer")
-    reports = compile_researcher_reports(messages)
-    if tool is None or not reports:
-        return None
-
-    compact = reports if len(reports) <= 12000 else reports[:12000] + "\n… [truncated]"
-    writer = make_llm(reasoning=False, num_predict=2048)
-    prompt = [
-        SystemMessage(
-            content=(
-                "You write the final user-facing answer for a research workflow. "
-                "Output ONLY markdown for the user. No plan, no tool talk, no "
-                "'I will now compose'. Start with a heading. Include a direct "
-                "recommendation, benefits and drawbacks for each option, source "
-                "URLs from the evidence, and a short confidence note."
-            )
-        ),
-        HumanMessage(
-            content=(
-                f"Original goal:\n{goal.strip()}\n\n"
-                f"Research evidence:\n{compact}\n\n"
-                "Write the complete markdown answer now."
-            )
-        ),
-    ]
-
-    tracer.note("Writing final_answer from researcher reports (no tool call from planner).")
-    try:
-        with tracer.thinking():
-            response = writer.invoke(prompt)
-    except Exception as exc:
-        tracer.note(f"Final-answer synthesis failed: {exc}")
-        return None
-
-    if not isinstance(response, AIMessage):
-        response = AIMessage(content=str(response))
-    prose = message_text(response) or thought_text(response)
-    tracer.thought(prose)
-    if not _usable_synthesis(prose):
-        return None
-    return _commit_final_answer(tool, prose, tracer)
-
-
-def _salvage_stop(result: AgentResult, messages: list[BaseMessage], stop: set[str]) -> None:
-    if result.stop_tool or result.payload or "final_answer" not in stop:
-        return
-    draft = planner_fallback_answer(messages)
-    if not draft:
-        return
-    result.payload = draft
-    result.stop_tool = "final_answer"
-    result.stopped_reason = f"salvaged_final_answer({result.stopped_reason})"
-    result.last_text = draft
 
 
 def _friendly_llm_error(exc: Exception) -> str:

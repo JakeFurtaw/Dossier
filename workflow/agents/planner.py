@@ -12,7 +12,7 @@ from workflow.tools import calculator, final_answer
 def run_planner(goal: str) -> AgentResult:
     """Run the planner ReAct loop for a high-level user goal."""
     return run_react(
-        make_llm(),
+        make_llm(role="planner"),
         [spawn_researchers, spawn_researcher, calculator, final_answer],
         PLANNER_SYSTEM,
         (

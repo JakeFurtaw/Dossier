@@ -9,9 +9,11 @@ from langchain_core.messages import BaseMessage
 from langchain_core.tools import tool
 
 from workflow.agents.evaluator import evaluate_findings
-from workflow.runtime.citations import build_evidence_index, citation_check_line
+from workflow.runtime.citations import build_evidence_index, citation_check_line, extract_urls
+from workflow.runtime.ledger import LedgerEntry, brief_text
 from workflow.runtime.react import run_react
 from workflow.runtime.recovery import researcher_fallback
+from workflow.runtime.tracing import try_get_bus
 from workflow.config import (
     CITATION_CHECK,
     EVALUATOR_ENABLED,
@@ -25,16 +27,53 @@ from workflow.tools import browse_page, report_findings, web_search
 from workflow.util import run_in_threads
 
 
+def researcher_user_message(task: str, digest: str = "") -> str:
+    body = (
+        f"Assigned task:\n{task.strip()}\n\n"
+        "Use web_search and browse_page as needed, then call report_findings. "
+        "report_findings is a tool. Two useful sources is enough."
+    )
+    if digest.strip():
+        body += f"\n\n{digest.strip()}"
+    return body
+
+
+def _peer_digest() -> str:
+    bus = try_get_bus()
+    if bus is None:
+        return ""
+    return bus.peer_digest("researcher")
+
+
+def _publish_report(agent_id: str, task: str, text: str) -> None:
+    if not (text or "").strip():
+        return
+    bus = try_get_bus()
+    if bus is None:
+        return
+    assign = " ".join((task or "").split())
+    if len(assign) > 80:
+        assign = assign[:79] + "…"
+    summary = brief_text(text)
+    title = f"{assign}: {summary}" if assign else summary
+    bus.publish_entry(
+        LedgerEntry(
+            role="researcher",
+            agent_id=agent_id,
+            kind="report",
+            title=title,
+            urls=extract_urls(text),
+            queries=[],
+        )
+    )
+
+
 def _gather_findings(task: str) -> tuple[str, str, list[BaseMessage]]:
     result = run_react(
-        make_llm(),
+        make_llm(role="researcher"),
         [web_search, browse_page, report_findings],
         RESEARCHER_SYSTEM,
-        (
-            f"Assigned task:\n{task.strip()}\n\n"
-            "Use web_search and browse_page as needed, then call report_findings. "
-            "report_findings is a tool. Two useful sources is enough."
-        ),
+        researcher_user_message(task, _peer_digest()),
         role="researcher",
         max_iterations=RESEARCHER_MAX_ITERS,
         stop_tools={"report_findings"},
@@ -60,6 +99,7 @@ def run_researcher(task: str, indent: str = "  ", *, allow_retry: bool = True) -
     del indent  # nesting comes from the live trace tree
     findings, agent_id, messages = _gather_findings(task)
     findings = _with_citation_check(findings, messages)
+    _publish_report(agent_id, task, findings)
     if not EVALUATOR_ENABLED:
         return findings
 
@@ -74,6 +114,7 @@ def run_researcher(task: str, indent: str = "  ", *, allow_retry: bool = True) -
         )
         second, second_id, second_messages = _gather_findings(retry_task)
         second = _with_citation_check(second, second_messages)
+        _publish_report(second_id, task, second)
         second_review = evaluate_findings(task, second, parent_id=second_id)
         return (
             f"{second.strip()}\n\n---\n\n{second_review.text}\n\n"
