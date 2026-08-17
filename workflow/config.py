@@ -1,4 +1,4 @@
-"""Runtime configuration for the multi-agent demo."""
+"""Runtime configuration."""
 
 from __future__ import annotations
 

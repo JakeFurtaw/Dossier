@@ -1,4 +1,4 @@
-"""Multi-agent ReAct workflow demo (Ollama + LangChain)."""
+"""Dossier — local multi-agent research runtime."""
 
 from workflow.config import DEFAULT_GOAL
 

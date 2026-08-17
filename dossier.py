@@ -1,21 +1,5 @@
 #!/usr/bin/env python3
-"""
-Multi-agent ReAct demo (Ollama + LangChain).
-
-How to extend later
--------------------
-- Add a worker role: write a system prompt, give it tools, and wrap it in a
-  LangChain `@tool` the same way `spawn_researcher` wraps `run_researcher`.
-- Add a real tool: implement a function in `workflow/tools/`, decorate it with
-  `@tool`, and attach it to the planner or researcher tool list.
-- Swap models: `OLLAMA_MODEL=gemma4:31b python agentic_workflow_test.py`
-- Per-role models: `OLLAMA_MODEL_EVALUATOR=qwen2.5:3b ...`
-- Point at a remote Ollama host: `OLLAMA_HOST=http://host:11434 ...`
-- Replay a saved run: `python agentic_workflow_test.py --replay runs/foo.md`
-
-This file is the spec entry point. The loop lives in `workflow/runtime/react.py`
-so Thought / Action / Observation stay visible instead of hidden inside a graph.
-"""
+"""Dossier — run or replay a multi-agent research session."""
 
 from __future__ import annotations
 
@@ -49,8 +33,8 @@ from workflow.config import (
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the multi-agent ReAct demo.")
-    parser.add_argument("goal", nargs="*", help="Goal to solve (default: Lisbon population).")
+    parser = argparse.ArgumentParser(description="Run a Dossier research session.")
+    parser.add_argument("goal", nargs="*", help="Research goal (default: compare agent frameworks).")
     parser.add_argument(
         "-v",
         "--verbose",

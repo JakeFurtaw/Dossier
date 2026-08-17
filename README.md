@@ -1,27 +1,55 @@
-# Mutli-Agent Workflow Demo
+# Dossier
 
-A minimal multi-agent ReAct demo. A **planner** decomposes a goal and can spawn **several researchers in parallel**. Each researcher’s report is checked by an **evaluator** (PASS / WEAK / FAIL) before it returns. The planner then calculates and calls `final_answer`.
+A local multi-agent research runtime. A planner fans out parallel researchers, an evaluator retries weak reports, and every cited URL is checked against tool output — no extra model call.
+
+Runs entirely on your machine through Ollama. The path is produced by the agents, not a hard-coded search-then-summarize chain.
+
+## What it does
+
+Give Dossier a goal. A **planner** writes a short plan and delegates independent questions in one turn. Each **researcher** runs its own ReAct loop (`web_search`, `browse_page`, then `report_findings`). An **evaluator** scores that report `PASS` / `WEAK` / `FAIL` and a `FAIL` gets one extra pass. The planner then does any arithmetic and must call `final_answer` — writing the answer in a thought does not finish the run.
+
+What is unusual is the reliability layer around that loop:
+
+- **Parallel supervisor** — `spawn_researchers` (or several `spawn_researcher` calls in one turn) runs workers at the same time, capped by `MAX_PARALLEL_RESEARCHERS`.
+- **Shared ledger** — researchers publish queries, URLs, and short report summaries so later siblings and retries do not repeat that work. Search and page fetches are cached and single-flighted per run.
+- **Deterministic citation audit** — every cited URL is checked against tool output (canonical host, no extra GPU). Numbers next to a URL are matched against the browsed page text. `CITATION_STRICT=1` fails the process if the final answer cites anything unverified.
+- **Salvage and replay** — if an agent hits the iteration cap without its stop tool, a fallback chain still returns the evidence it gathered. `--replay` re-renders a saved `runs/*.md` file without calling the model; `--reaudit` re-runs the current citation checker on that answer.
+
+The terminal stays compact: a live agent tree plus one-line tool actions and evaluator verdicts. Thoughts, page extracts, and full tool JSON stay in the markdown report unless you pass `--verbose`.
+
+## How a run is structured
+
+```
+goal
+ └─ planner
+     ├─ spawn_researchers
+     │   ├─ researcher  (search → browse → report_findings)
+     │   │   └─ evaluator  PASS | WEAK | FAIL  (+ one retry on FAIL)
+     │   └─ researcher  …
+     ├─ calculator      (only if the goal needs arithmetic)
+     └─ final_answer    → runs/YYYYMMDD-HHMMSS.md
+```
 
 ## Layout
 
 ```
+dossier.py             CLI entry point
 workflow/
-  agents/          planner, researcher, evaluator
-  runtime/         ReAct loop, TraceBus, salvage chain, markdown reports
-  tools/           web_search, browse_page, calculator, stop tools
+  agents/              planner, researcher, evaluator
+  runtime/             ReAct loop, TraceBus, salvage, citations, replay, reports
+  tools/               web_search, browse_page, calculator, stop tools
   config.py
   prompts.py
-  util.py
-tests/             pytest for citations, calc, recovery, replay, …
+tests/                 pytest for citations, calc, recovery, replay, ledger, …
 ```
+
+The loop lives in `workflow/runtime/react.py` so Thought / Action / Observation stay explicit instead of disappearing into a graph runtime.
 
 ## Setup
 
-Create the project conda environment (name is `test_muli-agent_workflow`):
-
 ```bash
-conda create -n test_muli-agent_workflow python=3.12 -y
-conda activate test_muli-agent_workflow
+conda create -n dossier python=3.12 -y
+conda activate dossier
 pip install -r requirements.txt
 playwright install chromium
 ```
@@ -33,43 +61,52 @@ ollama serve          # if it is not already running
 ollama list           # confirm the model is pulled
 ```
 
-## Run
+## Usage
 
 ```bash
-python agentic_workflow_test.py
-```
-
-Custom goal:
-
-```bash
-python agentic_workflow_test.py "What is the population of Porto, Portugal vs a town of 5,000?"
-```
-
-The terminal stays compact by default: a **live agent tree** plus one-line tool actions (and evaluator verdicts). Thoughts, page extracts, and full tool JSON are **not** printed. The markdown report still has the complete trace. Use `--verbose` for the old full panels.
-
-Each run also writes a report you can reopen later:
-
-```
-runs/YYYYMMDD-HHMMSS.md      # full trace + final answer
+python dossier.py
+python dossier.py "What is the population of Porto, Portugal vs a town of 5,000?"
 ```
 
 ```bash
-python agentic_workflow_test.py --verbose              # full Thought / Action / Observation panels
-python agentic_workflow_test.py --no-save              # skip writing runs/
-python agentic_workflow_test.py --report-dir ./out     # write reports somewhere else
-python agentic_workflow_test.py --replay runs/foo.md   # re-render a saved run (no LLM)
-python agentic_workflow_test.py --replay runs/foo.md --reaudit
+python dossier.py --verbose              # full Thought / Action / Observation panels
+python dossier.py --no-save              # skip writing runs/
+python dossier.py --report-dir ./out     # write reports somewhere else
+python dossier.py --replay runs/foo.md   # re-render a saved run (no LLM)
+python dossier.py --replay runs/foo.md --reaudit
 ```
 
-`--replay` reconstructs the event tree from a saved markdown report and
-re-renders it. `--reaudit` also runs the current citation checker against
-the saved final answer (useful after changing `citations.py`).
+`--replay` rebuilds the event tree from a saved markdown report and re-renders it. `--reaudit` also runs the current citation checker against the saved final answer (useful after changing `citations.py`).
 
 ```bash
 pytest
 ```
 
-Environment variables:
+Swap models without editing code:
+
+```bash
+OLLAMA_MODEL=gemma4:31b python dossier.py
+OLLAMA_MODEL_EVALUATOR=qwen2.5:3b python dossier.py
+OLLAMA_HOST=http://host:11434 python dossier.py
+```
+
+## Citation verification
+
+Every run audits where its sources came from — string matching only, no extra model calls:
+
+- each **researcher report** is checked against that researcher's own `web_search` / `browse_page` output. A `**Citation check:** …` line is appended so the planner and the evaluator both see it.
+- the **final answer** is checked against the researcher reports the planner received. The audit table lands in the run report as `## Citation audit (final answer)`.
+- numbers cited on the same line as a URL are also matched against the observed page text for that URL (researcher level only).
+
+URLs are compared canonically (no `www.`, `old.reddit.com` vs `reddit.com`, query/fragment/trailing-slash differences), so formatting drift is not treated as fabrication.
+
+## Shared context
+
+Researchers in the same run share a compact ledger: queries already issued, URLs already opened, and a short summary of each finished report. Later researchers — retries and a second spawn — see that digest in their prompt and are told not to repeat that work. `web_search` is cached per run the same way pages are, so two parallel researchers who pick the same query only hit the network once.
+
+The ledger is written into the run report as `## Shared context`.
+
+## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -88,39 +125,5 @@ Environment variables:
 | `MAX_PARALLEL_RESEARCHERS` | `3` | Cap on concurrent researcher tasks |
 | `EVALUATOR_ENABLED` | `1` | Run an evaluator after each researcher |
 | `EVALUATOR_RETRY` | `1` | One extra researcher pass if the evaluator says FAIL |
-| `CITATION_CHECK` | `1` | Verify cited URLs against tool output (researcher reports + final answer) |
+| `CITATION_CHECK` | `1` | Verify cited URLs against tool output |
 | `CITATION_STRICT` | `0` | Exit non-zero if any URL in the final answer is unverified |
-
-## Shared context
-
-Researchers in the same run share a compact ledger (queries already issued,
-URLs already opened, and a short summary of each finished report). Later
-researchers — retries and a second spawn — see that digest in their prompt
-and are told not to repeat that work. `web_search` is also cached per run
-(same idea as the page cache), so two parallel researchers who pick the same
-query only hit the network once.
-
-The ledger is written into the run report as `## Shared context`.
-
-## Citation verification
-
-Every run audits where its sources came from — pure string matching, no extra
-model calls, no GPU load:
-
-- each **researcher report** is checked against that researcher's own
-  `web_search` / `browse_page` output. A `**Citation check:** …` line is
-  appended to the report, so the planner and the evaluator both see it.
-- the **final answer** is checked against the researcher reports the planner
-  received. The audit table lands in the run report as
-  `## Citation audit (final answer)`.
-- numbers cited on the same line as a URL are also matched against the
-  observed page text for that URL (researcher level only).
-
-URLs are compared canonically (no `www.`, `old.reddit.com` vs `reddit.com`,
-query/fragment/trailing-slash differences), so formatting drift is not read as
-fabrication. `CITATION_STRICT=1` is meant for CI/evals: a run with unverified
-URLs exits non-zero.
-
-## Why this is an agentic workflow
-
-The system is given a **goal**, not a fixed pipeline. The planner writes a plan, then chooses tools at runtime based on what it still needs. Researcher sub-agents run their own ReAct loops: they search, read pages, and adapt if a query or URL fails. Observations are written back into conversation memory, so later thoughts can change the plan (retry a different query, browse a better source, or spawn another researcher). Arithmetic is a tool call, not a guessed number. The loop stops only when `final_answer` is called or an iteration cap is hit. That is the opposite of a single LLM call or a hard-coded search → summarize chain: the path is produced by the agents, not by the programmer.

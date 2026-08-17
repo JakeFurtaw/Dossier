@@ -1,8 +1,7 @@
 """Web search and page browse tools.
 
-Extracted from backend.py (DDGS + Playwright + Trafilatura) so this demo does
-not import the FastAPI / Nemotron stack. Search is cheap (snippets only);
-browse_page does the expensive full-page extract.
+Search is cheap (DDGS snippets only). ``browse_page`` does the full-page
+extract with Playwright + Trafilatura.
 
 One Chromium instance is launched per run (``BrowserPool``) and pages are
 opened against it. Thread-safe in-run URL and search caches on the
@@ -226,7 +225,7 @@ async def fetch_page(
     browser: Optional[Any] = None,
     wait_until: Optional[str] = None,
 ) -> str:
-    """Playwright + Trafilatura extract of a single URL (from backend.py)."""
+    """Playwright + Trafilatura extract of a single URL."""
     if timeout is None:
         timeout = web_config.browser_timeout
 
