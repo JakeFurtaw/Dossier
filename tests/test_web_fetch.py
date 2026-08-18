@@ -344,3 +344,103 @@ def test_fast_http_fetch_returns_none_kind_on_network_error() -> None:
     assert text == ""
     assert status is None
     assert kind is None
+
+
+def test_fetch_raw_returns_json_body_with_header() -> None:
+    from workflow.tools.web import _fetch_raw_body
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200, json={"rent": 2400, "zip": "20190"}, headers={"Content-Type": "application/json"}
+        )
+
+    client = _client_for(handler)
+    result = asyncio.run(_fetch_raw_body("https://api.example/units", http_client=client))
+    asyncio.run(client.aclose())
+    assert result.startswith("### Content from: https://api.example/units")
+    assert '"rent":2400' in result
+
+
+def test_fetch_raw_truncates_long_bodies() -> None:
+    from workflow.tools.web import RAW_MAX_CHARS, _fetch_raw_body
+
+    body = "y" * (RAW_MAX_CHARS + 500)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, content=body, headers={"Content-Type": "text/plain"})
+
+    client = _client_for(handler)
+    result = asyncio.run(_fetch_raw_body("https://api.example/big", http_client=client))
+    asyncio.run(client.aclose())
+    assert "more chars truncated" in result
+    assert result.count("y") == RAW_MAX_CHARS
+
+
+def test_fetch_raw_failure_points_to_browse_page() -> None:
+    from workflow.tools.web import _fetch_raw_body
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        raise httpx.ConnectError("nope")
+
+    client = _client_for(handler)
+    result = asyncio.run(_fetch_raw_body("https://down.example/api", http_client=client))
+    asyncio.run(client.aclose())
+    assert result.startswith("Failed to fetch https://down.example/api")
+    assert "browse_page" in result
+
+
+def test_fetch_raw_requires_full_url() -> None:
+    from workflow.tools.web import fetch_raw
+
+    assert fetch_raw.invoke({"url": "notaurl"}).startswith("Error:")
+
+
+def test_fetch_raw_cache_is_separate_from_browse_page(monkeypatch) -> None:
+    from workflow.runtime.tracing import get_bus, start_trace
+    from workflow.tools.web import fetch_raw
+
+    calls: list[str] = []
+
+    async def fake_raw(url: str, http_client=None):
+        calls.append(url)
+        return f"### Content from: {url}\n\nraw body"
+
+    monkeypatch.setattr("workflow.tools.web._fetch_raw_body", fake_raw)
+    with start_trace(goal="g", save=False, render=False, browser=False):
+        bus = get_bus()
+        bus.put_cached_url(
+            "https://example.com/page",
+            "### Content from: https://example.com/page\n\narticle body",
+        )
+        result = fetch_raw.invoke({"url": "https://example.com/page"})
+        again = fetch_raw.invoke({"url": "https://example.com/page"})
+    assert "raw body" in result  # not the browse_page article cache
+    assert again == result
+    assert len(calls) == 1  # second call served from the raw cache
+
+
+def test_fetch_raw_uses_pool_client_when_available(monkeypatch) -> None:
+    from workflow.tools.web import BrowserPool, _browser_pool, fetch_raw, set_browser_pool
+
+    pool = BrowserPool()
+    pool.start()
+    seen: dict = {}
+
+    async def fake_raw(url: str, http_client=None):
+        seen["client"] = http_client
+        return f"### Content from: {url}\n\npooled raw"
+
+    monkeypatch.setattr("workflow.tools.web._fetch_raw_body", fake_raw)
+    token = set_browser_pool(pool)
+    try:
+        client_ref = pool._http_client
+        result = fetch_raw.invoke({"url": "https://example.com/api"})
+    finally:
+        _browser_pool.reset(token)
+        pool.close()
+    assert "pooled raw" in result
+    assert seen["client"] is client_ref
+    assert pool._browser is None  # Chromium stays lazy

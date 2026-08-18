@@ -23,6 +23,7 @@ class SpecialistSpec:
     color: str = "magenta"
     batch_name: str = ""
     batch_description: str = ""
+    tools: tuple[str, ...] = ("web_search", "browse_page", "report_findings")
 
 
 @dataclass(frozen=True)

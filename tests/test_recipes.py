@@ -153,3 +153,41 @@ def test_cli_lists_and_selects_workflow(capsys) -> None:
     assert args.workflow == "apartments"
     assert " ".join(args.goal) == "2 bed near Wiehle"
     assert main(["--workflow", "spaceships"]) == 2
+
+
+def test_specialist_default_tools() -> None:
+    default = ("web_search", "browse_page", "report_findings")
+    assert get_recipe("research").specialist("researcher").tools == default
+    for name in ("listing", "geo", "amenities"):
+        assert get_recipe("apartments").specialist(name).tools == default
+
+
+def test_tools_for_spec_resolves_and_validates() -> None:
+    from workflow.agents.researcher import _tools_for_spec
+    from workflow.recipes import SpecialistSpec
+
+    names = [t.name for t in _tools_for_spec(get_recipe("research").specialist("researcher"))]
+    assert names == ["web_search", "browse_page", "report_findings"]
+
+    custom = SpecialistSpec(
+        name="api",
+        system_prompt="s",
+        description="d",
+        tools=("web_search", "fetch_raw", "report_findings"),
+    )
+    assert [t.name for t in _tools_for_spec(custom)] == [
+        "web_search",
+        "fetch_raw",
+        "report_findings",
+    ]
+
+    with pytest.raises(ValueError, match="report_findings"):
+        _tools_for_spec(
+            SpecialistSpec(name="bad1", system_prompt="s", description="d", tools=("web_search",))
+        )
+    with pytest.raises(ValueError, match="unknown tool"):
+        _tools_for_spec(
+            SpecialistSpec(
+                name="bad2", system_prompt="s", description="d", tools=("nope", "report_findings")
+            )
+        )

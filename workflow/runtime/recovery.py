@@ -20,7 +20,7 @@ from workflow.config import make_llm
 from workflow.runtime.metrics import record
 from workflow.util import message_text, thought_text
 
-_USEFUL_TOOLS = {"web_search", "browse_page"}
+_USEFUL_TOOLS = {"web_search", "browse_page", "fetch_raw"}
 
 
 def _is_spawn_tool(name: str) -> bool:

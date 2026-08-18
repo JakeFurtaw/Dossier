@@ -80,22 +80,28 @@ class SharedContext:
 
     # --- URL cache / lock -------------------------------------------------
 
-    def get_url(self, url: str) -> str | None:
+    def _url_key(self, url: str, kind: str) -> str | None:
         key = normalize_url(url)
+        if not key:
+            return None
+        return f"{kind}|{key}"
+
+    def get_url(self, url: str, kind: str = "page") -> str | None:
+        key = self._url_key(url, kind)
         if not key:
             return None
         with self._lock:
             return self._url_cache.get(key)
 
-    def put_url(self, url: str, content: str) -> None:
-        key = normalize_url(url)
+    def put_url(self, url: str, content: str, kind: str = "page") -> None:
+        key = self._url_key(url, kind)
         if not key:
             return
         with self._lock:
             self._url_cache[key] = content
 
-    def acquire_url(self, url: str) -> bool:
-        key = normalize_url(url)
+    def acquire_url(self, url: str, kind: str = "page") -> bool:
+        key = self._url_key(url, kind)
         if not key:
             return True
         with self._lock:
@@ -104,17 +110,17 @@ class SharedContext:
             self._url_inflight[key] = threading.Event()
             return True
 
-    def wait_url(self, url: str, timeout: float = 60.0) -> None:
-        key = normalize_url(url)
+    def wait_url(self, url: str, timeout: float = 60.0, kind: str = "page") -> None:
+        key = self._url_key(url, kind)
         with self._lock:
-            event = self._url_inflight.get(key)
+            event = self._url_inflight.get(key or "")
         if event is not None:
             event.wait(timeout=timeout)
 
-    def release_url(self, url: str) -> None:
-        key = normalize_url(url)
+    def release_url(self, url: str, kind: str = "page") -> None:
+        key = self._url_key(url, kind)
         with self._lock:
-            event = self._url_inflight.pop(key, None)
+            event = self._url_inflight.pop(key or "", None)
         if event is not None:
             event.set()
 

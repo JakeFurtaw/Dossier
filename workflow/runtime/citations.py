@@ -146,10 +146,10 @@ def build_evidence_index(messages: list[BaseMessage]) -> dict[str, Evidence]:
         if name == "web_search":
             for match in _SEARCH_URL_RE.finditer(text):
                 add(match.group(1), "web_search")
-        elif name == "browse_page":
+        elif name in ("browse_page", "fetch_raw"):
             header = _BROWSE_HEADER_RE.search(text)
             if header:
-                add(header.group(1), "browse_page", body=text[header.end() :])
+                add(header.group(1), name, body=text[header.end() :])
             else:
                 # Blocked / timeout / failed-extract message: the requested
                 # URL is still real provenance, just with no usable content.

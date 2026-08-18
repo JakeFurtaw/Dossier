@@ -43,7 +43,7 @@ workflow/
     apartments.py      Reston / Herndon listing + geo + amenities
   agents/              planner, specialist runner, evaluator
   runtime/             ReAct loop, TraceBus, salvage, citations, replay, reports
-  tools/               web_search, browse_page, calculator, stop tools
+  tools/               web_search, browse_page, fetch_raw, calculator, stop tools
   config.py
   prompts.py           re-exports the research prompts
 tests/                 pytest for citations, calc, recovery, replay, ledger, …

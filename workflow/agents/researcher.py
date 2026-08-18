@@ -25,7 +25,7 @@ from workflow.config import (
     RESEARCHER_MAX_ITERS,
     make_llm,
 )
-from workflow.tools import browse_page, calculator, final_answer, report_findings, web_search
+from workflow.tools import TOOL_REGISTRY, calculator, final_answer
 from workflow.util import run_in_threads
 
 
@@ -78,10 +78,33 @@ def _publish_report(agent_id: str, role: str, task: str, text: str) -> None:
     )
 
 
+def _tools_for_spec(spec: SpecialistSpec) -> list[Any]:
+    """Resolve the specialist's declared tool names to tool objects.
+
+    ``report_findings`` is the specialist's stop tool and must always be
+    present; unknown names fail fast with the list of known tools.
+    """
+    if "report_findings" not in spec.tools:
+        raise ValueError(
+            f"specialist {spec.name!r} must include 'report_findings' in its tools "
+            f"(got {list(spec.tools)})"
+        )
+    tools: list[Any] = []
+    for name in spec.tools:
+        tool = TOOL_REGISTRY.get(name)
+        if tool is None:
+            known = ", ".join(sorted(TOOL_REGISTRY))
+            raise ValueError(
+                f"specialist {spec.name!r} uses unknown tool {name!r} (known: {known})"
+            )
+        tools.append(tool)
+    return tools
+
+
 def _gather_findings(task: str, spec: SpecialistSpec) -> tuple[str, str, list[BaseMessage]]:
     result = run_react(
         make_llm(role="researcher"),
-        [web_search, browse_page, report_findings],
+        _tools_for_spec(spec),
         spec.system_prompt,
         researcher_user_message(task, _peer_digest(spec.name), spec),
         role=spec.name,

@@ -283,11 +283,11 @@ class TraceBus:
     def note(self, agent_id: str, role: str, step: int, text: str) -> None:
         self._emit(TraceEvent(kind="note", role=role, agent_id=agent_id, step=step, text=text))
 
-    def get_cached_url(self, url: str) -> str | None:
-        return self.shared.get_url(url)
+    def get_cached_url(self, url: str, kind: str = "page") -> str | None:
+        return self.shared.get_url(url, kind=kind)
 
-    def put_cached_url(self, url: str, content: str) -> None:
-        self.shared.put_url(url, content)
+    def put_cached_url(self, url: str, content: str, kind: str = "page") -> None:
+        self.shared.put_url(url, content, kind=kind)
 
     def get_cached_search(self, query: str, max_results: int) -> str | None:
         return self.shared.get_search(query, max_results)
@@ -304,14 +304,14 @@ class TraceBus:
     def release_search(self, query: str, max_results: int) -> None:
         self.shared.release_search(query, max_results)
 
-    def acquire_url_fetch(self, url: str) -> bool:
-        return self.shared.acquire_url(url)
+    def acquire_url_fetch(self, url: str, kind: str = "page") -> bool:
+        return self.shared.acquire_url(url, kind=kind)
 
-    def wait_url_fetch(self, url: str, timeout: float = 60.0) -> None:
-        self.shared.wait_url(url, timeout=timeout)
+    def wait_url_fetch(self, url: str, timeout: float = 60.0, kind: str = "page") -> None:
+        self.shared.wait_url(url, timeout=timeout, kind=kind)
 
-    def release_url_fetch(self, url: str) -> None:
-        self.shared.release_url(url)
+    def release_url_fetch(self, url: str, kind: str = "page") -> None:
+        self.shared.release_url(url, kind=kind)
 
     def publish_entry(self, entry: LedgerEntry) -> None:
         self.shared.publish(entry)

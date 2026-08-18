@@ -156,3 +156,18 @@ def test_audit_to_markdown_table() -> None:
     assert "| URL | Verified | Seen in | Numbers |" in md
     assert "1/1 URLs traced" in md
     assert audit_to_markdown(audit_citations("", index, stage="t")) == "_No source URLs cited._"
+
+
+def test_evidence_index_counts_fetch_raw_output() -> None:
+    messages = [
+        ToolMessage(
+            content='### Content from: https://api.example/units\n\n{"rent": 2400}',
+            tool_call_id="1",
+            name="fetch_raw",
+        )
+    ]
+    index = build_evidence_index(messages)
+    entry = index.get("api.example/units")
+    assert entry is not None
+    assert entry.sources == ["fetch_raw"]
+    assert "2400" in entry.body

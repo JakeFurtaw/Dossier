@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 MIN_HTML_CHARS = 200
 MIN_EXTRACTED_CHARS = 300
 MAX_HTTP_BODY_BYTES = 20 * 1024 * 1024
+RAW_MAX_CHARS = 8000
 
 _TEXT_CONTENT_TYPES = (
     "text/html",
@@ -239,6 +240,16 @@ class BrowserPool:
         )
         return future.result()
 
+    def fetch_raw_body(self, url: str) -> str:
+        """Raw HTTP body on the pool loop (shared client, keep-alive)."""
+        if self._loop is None or self._http_client is None:
+            raise RuntimeError("Fetch worker is not running")
+        future = asyncio.run_coroutine_threadsafe(
+            _fetch_raw_body(url, http_client=self._http_client),
+            self._loop,
+        )
+        return future.result()
+
     async def _playwright_fetch(
         self,
         url: str,
@@ -298,6 +309,12 @@ def _truncate_at_sentence(text: str, max_chars: int | None = None) -> str:
         truncated.rfind("\n\n"),
     )
     return truncated[: last_stop + 1] if last_stop > 0 else truncated[:max_chars]
+
+
+def _truncate_chars(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n… [{len(text) - limit} more chars truncated]"
 
 
 def _normalize_url(url: str) -> str:
@@ -516,6 +533,39 @@ async def _http_extract_or_none(
         reason = f"thin extract ({len(extracted)} chars)"
     logger.info("Falling back to Playwright for %s (%s)", url, reason)
     return None
+
+
+async def _fetch_raw_body(url: str, http_client: httpx.AsyncClient | None = None) -> str:
+    """HTTP-only raw fetch for JSON / XML / CSV / plain-text endpoints.
+
+    Never falls back to Playwright: a rendered JS app is not the raw body
+    the caller asked for, so failures say to use browse_page instead.
+    """
+    html, status, _headers, kind = await _fast_http_fetch(
+        url, timeout=web_config.http_timeout, client=http_client
+    )
+    if kind == "binary":
+        return _format_extract(
+            url,
+            "This URL is a binary file (not text), so no raw body was retrieved. "
+            "Open the link directly if you need the file.",
+        )
+    if kind == "too_large":
+        limit_mb = MAX_HTTP_BODY_BYTES // (1024 * 1024)
+        return _format_extract(url, f"This URL returned more than {limit_mb} MB and was skipped.")
+    if kind == "pdf":
+        return _format_extract(
+            url,
+            "This URL is a PDF. No raw text was read "
+            "(open the link directly if you need the file).",
+        )
+    if not html:
+        status_txt = f" (HTTP {status})" if status else ""
+        return (
+            f"Failed to fetch {url}{status_txt}. "
+            "If the page needs JavaScript, use browse_page instead."
+        )
+    return _format_extract(url, _truncate_chars(html, RAW_MAX_CHARS))
 
 
 async def _page_html_capped(page: Any) -> str:
@@ -853,6 +903,58 @@ def browse_page(url: str, instructions: str = "") -> str:
             bus.release_url_fetch(target)
 
 
+@tool
+def fetch_raw(url: str) -> str:
+    """Fetch the raw text body (JSON, XML, CSV, plain text) of ONE URL.
+
+    Use for public APIs and structured endpoints where browse_page's
+    article extraction would mangle the content. Returns at most 8,000
+    characters. For normal webpages, use browse_page instead.
+    """
+    target = (url or "").strip()
+    if not target.startswith(("http://", "https://")):
+        return "Error: fetch_raw requires a valid full http(s) URL."
+
+    cached = _cache_get(target, kind="raw")
+    if cached is not None:
+        from workflow.runtime.metrics import record
+
+        record("url_cache_hit")
+        return cached
+
+    bus = _trace_bus()
+    owned = bus.acquire_url_fetch(target, kind="raw") if bus is not None else True
+    if bus is not None and not owned:
+        bus.wait_url_fetch(target, kind="raw")
+        cached = _cache_get(target, kind="raw")
+        if cached is not None:
+            from workflow.runtime.metrics import record
+
+            record("url_cache_hit")
+            return cached
+
+    try:
+        content = _fetch_raw_sync(target)
+        _cache_put(target, content, kind="raw")
+        _publish_browse(bus, target, blocked=content.startswith("Failed"))
+        return content
+    finally:
+        if bus is not None and owned:
+            bus.release_url_fetch(target, kind="raw")
+
+
+def _fetch_raw_sync(url: str) -> str:
+    """Raw HTTP via the run's BrowserPool (shared client) when present."""
+    url = _normalize_url(url)
+    pool = get_browser_pool()
+    if pool is not None:
+        try:
+            return pool.fetch_raw_body(url)
+        except Exception as exc:
+            logger.info("Pooled raw fetch failed for %s: %s; retrying locally", url, exc)
+    return _run_async(_fetch_raw_body(url))
+
+
 def _fetch_page_sync(url: str) -> str:
     """HTTP via the run's BrowserPool (shared client, keep-alive) when present.
 
@@ -896,18 +998,18 @@ def _with_focus(content: str, instructions: str) -> str:
     return content
 
 
-def _cache_get(url: str) -> str | None:
+def _cache_get(url: str, kind: str = "page") -> str | None:
     bus = _trace_bus()
     if bus is None:
         return None
-    return bus.get_cached_url(url)
+    return bus.get_cached_url(url, kind=kind)
 
 
-def _cache_put(url: str, content: str) -> None:
+def _cache_put(url: str, content: str, kind: str = "page") -> None:
     bus = _trace_bus()
     if bus is None:
         return
-    bus.put_cached_url(url, content)
+    bus.put_cached_url(url, content, kind=kind)
 
 
 def _publish_search(bus, query: str, result: str) -> None:
