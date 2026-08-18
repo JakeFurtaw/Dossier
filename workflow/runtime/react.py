@@ -21,7 +21,9 @@ from workflow.runtime.tracing import TracePrinter
 from workflow.config import LLM_RETRIES
 from workflow.util import message_text, run_in_threads, thought_text
 
-_PARALLEL_TOOLS = {"spawn_researcher", "spawn_researchers"}
+def _is_parallel_tool(name: str) -> bool:
+    """Planner spawn tools may run concurrently; everything else stays serial."""
+    return (name or "").startswith("spawn_")
 
 
 @dataclass
@@ -145,13 +147,12 @@ def run_react(
     role: str,
     max_iterations: int,
     stop_tools: Iterable[str],
-    indent: str = "",
 ) -> AgentResult:
     """Run Thought → Action → Observation until a stop tool or iteration cap."""
     stop = set(stop_tools)
     tool_map = {t.name: t for t in tools}
     names = ", ".join(tool_map)
-    tracer = TracePrinter(role, indent=indent, max_iterations=max_iterations)
+    tracer = TracePrinter(role, max_iterations=max_iterations)
     llm_with_tools = llm.bind_tools(list(tools))
 
     messages: list[BaseMessage] = [
@@ -242,7 +243,7 @@ def run_react(
             for call in calls:
                 tracer.action(call["name"], call["args"])
 
-            if len(calls) > 1 and all(call["name"] in _PARALLEL_TOOLS for call in calls):
+            if len(calls) > 1 and all(_is_parallel_tool(call["name"]) for call in calls):
                 observations = _invoke_parallel(calls, tool_map)
             else:
                 observations = [_invoke_one(call, tool_map, tracer) for call in calls]

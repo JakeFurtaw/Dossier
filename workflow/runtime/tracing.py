@@ -32,10 +32,21 @@ _ROLE_COLOR = {
     "planner": "cyan",
     "researcher": "magenta",
     "evaluator": "green",
+    "listing": "yellow",
+    "geo": "blue",
+    "amenities": "bright_magenta",
 }
 
 
 def _role_color(role: str) -> str:
+    try:
+        from workflow.recipes import active_recipe
+
+        color = active_recipe().role_colors.get(role)
+        if color:
+            return color
+    except Exception:
+        pass
     return _ROLE_COLOR.get(role, "white")
 
 
@@ -63,8 +74,8 @@ def _observation_summary(text: str) -> str:
         return f"{match.group(1)} search hits"
     if (text or "").startswith("Blocked:"):
         return "page blocked"
-    if "Parallel researcher" in (text or ""):
-        n = (text or "").count("### Parallel researcher")
+    if "Parallel researcher" in (text or "") or "Parallel agent" in (text or ""):
+        n = (text or "").count("### Parallel researcher") + (text or "").count("### Parallel agent")
         return f"{n or 1} parallel report(s)"
     chars = len(text or "")
     return f"ok · {chars} chars"
@@ -90,6 +101,8 @@ class AgentNode:
     status: str = "idle"
     activity: str = ""
     children: list[AgentNode] = field(default_factory=list)
+    parent_id: str = ""
+    depth: int = 0
 
     @property
     def busy(self) -> bool:
@@ -126,7 +139,6 @@ class TraceBus:
         save: bool = True,
         report_dir: str | Path = REPORT_DIR,
         config: dict[str, Any] | None = None,
-        counters: Counters | None = None,
     ) -> None:
         self.goal = goal
         self.verbose = verbose
@@ -148,7 +160,6 @@ class TraceBus:
         self._lock = threading.RLock()
         self._listeners: list[TraceListener] = []
         self.shared = SharedContext()
-        self.counters = counters or Counters()
         self.started = datetime.now().astimezone()
         self.final = ""
         self.reason = ""
@@ -347,14 +358,7 @@ class TraceBus:
 
     def depth(self, agent_id: str) -> int:
         node = self.nodes.get(agent_id)
-        depth = 0
-        while node:
-            parent = self._parent_of(node)
-            if parent is None:
-                break
-            depth += 1
-            node = parent
-        return depth
+        return node.depth if node else 0
 
     def _attach_agent(
         self,
@@ -372,6 +376,8 @@ class TraceBus:
             parent.activity = f"waiting on {role}"
         else:
             self.roots.append(node)
+        node.parent_id = parent.agent_id if parent else ""
+        node.depth = (parent.depth + 1) if parent else 0
         self.nodes[agent_id] = node
         return node
 
@@ -380,7 +386,7 @@ class TraceBus:
         if node:
             node.status = "done"
             node.activity = reason
-        parent = self._parent_of(node) if node else None
+        parent = self.nodes.get(node.parent_id) if node and node.parent_id else None
         if parent and parent.status == "waiting":
             still_busy = any(
                 child.busy for child in parent.children if child.agent_id != agent_id
@@ -398,24 +404,16 @@ class TraceBus:
     def _replay_parent(self, role: str) -> str | None:
         if role == "planner":
             return None
-        if role == "researcher":
-            for node in reversed(list(self.nodes.values())):
-                if node.role == "planner":
-                    return node.agent_id
-            return None
         if role == "evaluator":
             for node in reversed(list(self.nodes.values())):
-                if node.role == "researcher":
+                if node.role not in {"planner", "evaluator"}:
                     return node.agent_id
             return None
+        for node in reversed(list(self.nodes.values())):
+            if node.role == "planner":
+                return node.agent_id
         if self.roots:
             return self.roots[-1].agent_id
-        return None
-
-    def _parent_of(self, node: AgentNode) -> AgentNode | None:
-        for candidate in self.nodes.values():
-            if node in candidate.children:
-                return candidate
         return None
 
     def _emit(self, event: TraceEvent) -> None:
@@ -485,8 +483,14 @@ class RichRenderer(TraceListener):
             ),
             self._Text(goal_preview, style="italic"),
         )
+        workflow = str(bus.config.get("workflow") or "research")
         self.console.print(
-            self._Panel(header, title="Agentic workflow", border_style="bright_blue", padding=(0, 1))
+            self._Panel(
+                header,
+                title=f"Dossier · {workflow}",
+                border_style="bright_blue",
+                padding=(0, 1),
+            )
         )
         self._live = self._Live(
             self._status_renderable(),
@@ -512,8 +516,10 @@ class RichRenderer(TraceListener):
         if renderable is None:
             return
         out = renderable
-        if self.verbose and bus.depth(event.agent_id):
-            out = self._Padding(renderable, (0, 0, 0, bus.depth(event.agent_id) * 2))
+        if self.verbose:
+            depth = bus.depth(event.agent_id)
+            if depth:
+                out = self._Padding(renderable, (0, 0, 0, depth * 2))
         self._print(out)
 
     def on_complete(self, bus: TraceBus, citation_summary: str = "") -> None:
@@ -643,12 +649,10 @@ class TracePrinter:
     def __init__(
         self,
         role: str,
-        indent: str = "",
         max_iterations: int = 0,
         parent_id: str | None = None,
     ) -> None:
         self.role = role
-        self.indent = indent
         self.session = get_bus()
         self.agent_id = self.session.start_agent(
             role, max_iterations=max_iterations, parent_id=parent_id
@@ -698,11 +702,6 @@ def get_bus() -> TraceBus:
     return _fallback
 
 
-def get_session() -> TraceBus:
-    """Alias kept so older call sites keep working."""
-    return get_bus()
-
-
 def current_agent() -> tuple[str, str]:
     """Return (agent_id, role) for the agent on this thread, or empty strings."""
     stack = _agent_stack.get()
@@ -734,7 +733,6 @@ def start_trace(
         save=save,
         report_dir=report_dir,
         config=config,
-        counters=counters,
     )
     if render:
         RichRenderer(bus, verbose=verbose)

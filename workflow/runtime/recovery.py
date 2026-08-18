@@ -21,7 +21,10 @@ from workflow.runtime.metrics import record
 from workflow.util import message_text, thought_text
 
 _USEFUL_TOOLS = {"web_search", "browse_page"}
-_SPAWN_TOOLS = {"spawn_researcher", "spawn_researchers"}
+
+
+def _is_spawn_tool(name: str) -> bool:
+    return (name or "").startswith("spawn_")
 _BLOCKED_MARKERS = (
     "blocked:",
     "captcha",
@@ -37,10 +40,6 @@ def is_blocked(text: str) -> bool:
     """True when tool output is a blocked/empty/failed page, not usable evidence."""
     lower = (text or "").lower()
     return any(marker in lower for marker in _BLOCKED_MARKERS)
-
-
-# Kept as a private alias so existing imports/tests can use either name.
-_blocked = is_blocked
 
 
 def _tool_chunks(
@@ -67,7 +66,15 @@ def _tool_chunks(
 
 
 def compile_researcher_reports(messages: Iterable[BaseMessage], limit: int = 12000) -> str:
-    return "\n\n---\n\n".join(_tool_chunks(messages, _SPAWN_TOOLS, limit))
+    collected = list(messages)
+    names = {
+        getattr(message, "name", "") or ""
+        for message in collected
+        if _is_spawn_tool(getattr(message, "name", "") or "")
+    }
+    if not names:
+        return ""
+    return "\n\n---\n\n".join(_tool_chunks(collected, names, limit))
 
 
 def planner_fallback_answer(messages: Iterable[BaseMessage], goal: str = "") -> str:
@@ -179,15 +186,7 @@ class PlannerLlmSynthesis:
         compact = reports if len(reports) <= 12000 else reports[:12000] + "\n… [truncated]"
         writer = make_llm(role="planner", reasoning=False, num_predict=2048)
         prompt = [
-            SystemMessage(
-                content=(
-                    "You write the final user-facing answer for a research workflow. "
-                    "Output ONLY markdown for the user. No plan, no tool talk, no "
-                    "'I will now compose'. Start with a heading. Include a direct "
-                    "recommendation, benefits and drawbacks for each option, source "
-                    "URLs from the evidence, and a short confidence note."
-                )
-            ),
+            SystemMessage(content=_synthesis_system()),
             HumanMessage(
                 content=(
                     f"Original goal:\n{ctx.goal.strip()}\n\n"
@@ -308,14 +307,36 @@ FALLBACK_CHAINS: dict[str, list[FallbackTier]] = {
 
 def should_fallback_early(role: str, stop_tools: set[str], messages: list[BaseMessage]) -> bool:
     """True when the agent went quiet but already has enough evidence to salvage."""
-    if role == "planner" and "final_answer" in stop_tools:
+    del role
+    if "final_answer" in stop_tools:
         return bool(compile_researcher_reports(messages))
     return False
 
 
+def _chain_for(ctx: FallbackContext) -> list[FallbackTier]:
+    if ctx.role in FALLBACK_CHAINS:
+        return FALLBACK_CHAINS[ctx.role]
+    if "final_answer" in ctx.stop_tools:
+        return FALLBACK_CHAINS["planner"]
+    if "report_findings" in ctx.stop_tools:
+        return FALLBACK_CHAINS["researcher"]
+    return []
+
+
+def _synthesis_system() -> str:
+    try:
+        from workflow.recipes import active_recipe
+
+        return active_recipe().synthesis_system
+    except Exception:
+        from workflow.recipes.research import SYNTHESIS_SYSTEM
+
+        return SYNTHESIS_SYSTEM
+
+
 def run_fallback_chain(ctx: FallbackContext) -> FallbackOutcome | None:
     """Walk the role's tiers. First non-None payload (or give-up) wins."""
-    chain = FALLBACK_CHAINS.get(ctx.role, [])
+    chain = _chain_for(ctx)
     for tier in chain:
         if not tier.applies(ctx):
             continue

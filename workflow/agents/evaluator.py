@@ -7,9 +7,9 @@ from dataclasses import dataclass
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from workflow.recipes import active_recipe
 from workflow.runtime.tracing import TracePrinter
 from workflow.config import make_llm
-from workflow.prompts import EVALUATOR_SYSTEM
 
 
 @dataclass
@@ -52,7 +52,7 @@ def evaluate_findings(task: str, findings: str, parent_id: str | None = None) ->
     try:
         with printer.thinking():
             response = llm.invoke(
-                [SystemMessage(content=EVALUATOR_SYSTEM), HumanMessage(content=prompt)]
+                [SystemMessage(content=active_recipe().evaluator_system), HumanMessage(content=prompt)]
             )
     except Exception as exc:
         printer.note(f"Evaluator LLM error: {exc}")

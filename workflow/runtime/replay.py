@@ -166,6 +166,8 @@ def _parse_header(header: str, run: ReplayRun) -> None:
             run.reason = value
         elif key == "Started":
             run.config["started"] = value
+        elif key == "Workflow":
+            run.config["workflow"] = value
         elif key == "Models":
             for part in value.split(","):
                 if "=" in part:

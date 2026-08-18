@@ -16,7 +16,7 @@ from workflow.runtime.citations import extract_urls, normalize_url
 
 _CITATION_LINE = re.compile(r"^\*\*Citation check:\*\*.*$", re.MULTILINE)
 _DIGEST_HEADER = (
-    "Already gathered by other researchers this run. "
+    "Already gathered by other agents this run. "
     "Treat sourced facts below as collected. Do not repeat these queries or "
     "URLs unless your task needs a fact they do not cover."
 )

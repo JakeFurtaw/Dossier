@@ -7,6 +7,7 @@ import argparse
 import sys
 
 from workflow.agents.planner import run_planner
+from workflow.recipes import Recipe, get_recipe, list_recipes, use_recipe
 from workflow.runtime.citations import (
     audit_citations,
     audit_to_markdown,
@@ -18,7 +19,6 @@ from workflow.runtime.tracing import start_trace
 from workflow.config import (
     CITATION_CHECK,
     CITATION_STRICT,
-    DEFAULT_GOAL,
     HOST,
     MODEL,
     MODEL_EVALUATOR,
@@ -34,7 +34,19 @@ from workflow.config import (
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a Dossier research session.")
-    parser.add_argument("goal", nargs="*", help="Research goal (default: compare agent frameworks).")
+    parser.add_argument("goal", nargs="*", help="Research goal (default depends on --workflow).")
+    parser.add_argument(
+        "-w",
+        "--workflow",
+        default="research",
+        metavar="NAME",
+        help="Recipe to run: research (default) or apartments. See --list-workflows.",
+    )
+    parser.add_argument(
+        "--list-workflows",
+        action="store_true",
+        help="List available workflows and exit.",
+    )
     parser.add_argument(
         "-v",
         "--verbose",
@@ -65,8 +77,17 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def run(goal: str, *, verbose: bool, save: bool, report_dir: str) -> int:
+def run(
+    goal: str,
+    *,
+    verbose: bool,
+    save: bool,
+    report_dir: str,
+    recipe: Recipe | None = None,
+) -> int:
+    chosen = recipe or get_recipe("research")
     config = {
+        "workflow": chosen.name,
         "model": MODEL,
         "model_planner": MODEL_PLANNER,
         "model_researcher": MODEL_RESEARCHER,
@@ -76,14 +97,14 @@ def run(goal: str, *, verbose: bool, save: bool, report_dir: str) -> int:
         "num_predict": NUM_PREDICT,
         "planner_max_iters": PLANNER_MAX_ITERS,
     }
-    with start_trace(
+    with use_recipe(chosen), start_trace(
         goal=goal,
         verbose=verbose,
         save=save,
         report_dir=report_dir,
         config=config,
     ) as session:
-        result = run_planner(goal)
+        result = run_planner(goal, recipe=chosen)
         final = result.payload if result.stop_tool == "final_answer" else ""
         citation_md = ""
         citation_summary = ""
@@ -111,6 +132,10 @@ def run(goal: str, *, verbose: bool, save: bool, report_dir: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
+    if args.list_workflows:
+        for recipe in list_recipes():
+            print(f"{recipe.name:12} {recipe.description}")
+        return 0
     if args.replay:
         replay_from_path(
             args.replay,
@@ -120,8 +145,19 @@ def main(argv: list[str] | None = None) -> int:
             report_dir=args.report_dir,
         )
         return 0
-    goal = " ".join(args.goal).strip() if args.goal else DEFAULT_GOAL
-    return run(goal, verbose=args.verbose, save=not args.no_save, report_dir=args.report_dir)
+    try:
+        recipe = get_recipe(args.workflow)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    goal = " ".join(args.goal).strip() if args.goal else recipe.default_goal
+    return run(
+        goal,
+        verbose=args.verbose,
+        save=not args.no_save,
+        report_dir=args.report_dir,
+        recipe=recipe,
+    )
 
 
 if __name__ == "__main__":

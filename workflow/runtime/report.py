@@ -52,6 +52,8 @@ def events_to_markdown(
         f"- **Host:** {config.get('host', '')}",
         f"- **Status:** {reason or 'unknown'}",
     ]
+    if config.get("workflow"):
+        lines.append(f"- **Workflow:** {config['workflow']}")
     role_models = {
         "planner": config.get("model_planner"),
         "researcher": config.get("model_researcher"),

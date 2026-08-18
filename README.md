@@ -1,17 +1,20 @@
 # Dossier
 
-A local multi-agent research runtime. A planner fans out parallel researchers, an evaluator retries weak reports, and every cited URL is checked against tool output — no extra model call.
+A local multi-agent research runtime. A planner fans out parallel specialists, an evaluator retries weak reports, and every cited URL is checked against tool output — no extra model call.
+
+The loop is shared. A **recipe** is just the prompts and the specialist agents the planner is allowed to spawn. `research` is general-purpose; `apartments` is the same runtime aimed at a Reston / Herndon hunt.
 
 Runs entirely on your machine through Ollama. The path is produced by the agents, not a hard-coded search-then-summarize chain.
 
 ## What it does
 
-Give Dossier a goal. A **planner** writes a short plan and delegates independent questions in one turn. Each **researcher** runs its own ReAct loop (`web_search`, `browse_page`, then `report_findings`). An **evaluator** scores that report `PASS` / `WEAK` / `FAIL` and a `FAIL` gets one extra pass. The planner then does any arithmetic and must call `final_answer` — writing the answer in a thought does not finish the run.
+Give Dossier a goal and a recipe (`--workflow`). A **planner** writes a short plan and delegates independent questions in one turn. Each **specialist** (a researcher, or listing / geo / amenities in the apartment recipe) runs its own ReAct loop (`web_search`, `browse_page`, then `report_findings`). An **evaluator** scores that report `PASS` / `WEAK` / `FAIL` and a `FAIL` gets one extra pass. The planner then does any arithmetic and must call `final_answer` — writing the answer in a thought does not finish the run.
 
 What is unusual is the reliability layer around that loop:
 
 - **Parallel supervisor** — `spawn_researchers` (or several `spawn_researcher` calls in one turn) runs workers at the same time, capped by `MAX_PARALLEL_RESEARCHERS`.
 - **Shared ledger** — researchers publish queries, URLs, and short report summaries so later siblings and retries do not repeat that work. Search and page fetches are cached and single-flighted per run.
+- **Hybrid browse** — `browse_page` tries a 20 MB-capped httpx GET first. Playwright only runs for thin, JS-heavy, or anti-bot pages, in an isolated browser context, and Chromium starts only on that first fallback.
 - **Deterministic citation audit** — every cited URL is checked against tool output (canonical host, no extra GPU). Numbers next to a URL are matched against the browsed page text. `CITATION_STRICT=1` fails the process if the final answer cites anything unverified.
 - **Salvage and replay** — if an agent hits the iteration cap without its stop tool, a fallback chain still returns the evidence it gathered. `--replay` re-renders a saved `runs/*.md` file without calling the model; `--reaudit` re-runs the current citation checker on that answer.
 
@@ -21,13 +24,13 @@ The terminal stays compact: a live agent tree plus one-line tool actions and eva
 
 ```
 goal
- └─ planner
-     ├─ spawn_researchers
-     │   ├─ researcher  (search → browse → report_findings)
+ └─ planner                         (prompts come from the recipe)
+     ├─ spawn_*                     (researchers, or listing + geo + amenities)
+     │   ├─ specialist  (search → browse → report_findings)
      │   │   └─ evaluator  PASS | WEAK | FAIL  (+ one retry on FAIL)
-     │   └─ researcher  …
-     ├─ calculator      (only if the goal needs arithmetic)
-     └─ final_answer    → runs/YYYYMMDD-HHMMSS.md
+     │   └─ specialist  …
+     ├─ calculator                  (only if the goal needs arithmetic)
+     └─ final_answer                → runs/YYYYMMDD-HHMMSS.md
 ```
 
 ## Layout
@@ -35,15 +38,18 @@ goal
 ```
 dossier.py             CLI entry point
 workflow/
-  agents/              planner, researcher, evaluator
+  recipes/             named workflows (prompts + specialist roster)
+    research.py        general research (default)
+    apartments.py      Reston / Herndon listing + geo + amenities
+  agents/              planner, specialist runner, evaluator
   runtime/             ReAct loop, TraceBus, salvage, citations, replay, reports
   tools/               web_search, browse_page, calculator, stop tools
   config.py
-  prompts.py
+  prompts.py           re-exports the research prompts
 tests/                 pytest for citations, calc, recovery, replay, ledger, …
 ```
 
-The loop lives in `workflow/runtime/react.py` so Thought / Action / Observation stay explicit instead of disappearing into a graph runtime.
+The loop lives in `workflow/runtime/react.py` so Thought / Action / Observation stay explicit instead of disappearing into a graph runtime. Add a recipe by dropping a module next to `research.py` that builds a `Recipe` (planner prompt, specialist prompts, spawn-tool descriptions) and registering it in `workflow/recipes/__init__.py`.
 
 ## Setup
 
@@ -66,6 +72,9 @@ ollama list           # confirm the model is pulled
 ```bash
 python dossier.py
 python dossier.py "What is the population of Porto, Portugal vs a town of 5,000?"
+python dossier.py --workflow apartments
+python dossier.py --workflow apartments "2 bed under $2800 near Wiehle, pets ok"
+python dossier.py --list-workflows
 ```
 
 ```bash
@@ -77,6 +86,8 @@ python dossier.py --replay runs/foo.md --reaudit
 ```
 
 `--replay` rebuilds the event tree from a saved markdown report and re-renders it. `--reaudit` also runs the current citation checker against the saved final answer (useful after changing `citations.py`).
+
+`--workflow apartments` keeps the same tools and loop. The orchestrator spawns a **listing** agent (public listing sites → a normalized table; there is no RentCast/Apify API in this runtime), a **geo** agent (Reston Town Center, Silver Line stations, Dulles Toll Road), then an **amenities** agent that scores units and estimates total monthly cost. Pass your own constraints as the goal; the default is a Reston / Herndon 1–2 bed hunt under $3,000.
 
 ```bash
 pytest

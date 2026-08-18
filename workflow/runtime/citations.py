@@ -37,7 +37,8 @@ _BROWSE_HEADER_RE = re.compile(r"###\s+Content from:\s*(\S+)")
 _NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?%?")
 _TRAILING_PUNCT = ".,;:!?)]}'\""
 
-_SPAWN_TOOLS = {"spawn_researcher", "spawn_researchers"}
+def _is_spawn_tool(name: str) -> bool:
+    return (name or "").startswith("spawn_")
 
 
 @dataclass
@@ -155,7 +156,7 @@ def build_evidence_index(messages: list[BaseMessage]) -> dict[str, Evidence]:
                 first = _URL_RE.search(text)
                 if first:
                     add(first.group(0), "browse_page (no content)")
-        elif name in _SPAWN_TOOLS:
+        elif _is_spawn_tool(name):
             for url in extract_urls(text):
                 add(url, "researcher report")
     return index
