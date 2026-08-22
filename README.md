@@ -52,10 +52,25 @@ tests/                 pytest for citations, calc, recovery, replay, ledger, …
 The loop lives in `workflow/runtime/react.py` so Thought / Action / Observation stay explicit instead of disappearing into a graph runtime. Add a recipe by dropping a module next to `research.py` that builds a `Recipe` (planner prompt, specialist prompts, spawn-tool descriptions) and registering it in `workflow/recipes/__init__.py`.
 
 ## Setup
+The Dossier conda environment was renamed from `test_muli-agent_workflow` to `"Dossier"`.
+
+If you haven't renamed it yet, run:
+```bash
+conda rename -n test_muli-agent_workflow Dossier
+```
+
+To activate the existing Dossier environment (recommended):
+```bash
+conda activate Dossier
+```
+
+Or create a fresh one (if you prefer a clean slate):
+```bash
+# conda create -n dossier python=3.12 -y
+# conda activate dossier
+```
 
 ```bash
-conda create -n dossier python=3.12 -y
-conda activate dossier
 pip install -r requirements.txt
 playwright install chromium
 ```
