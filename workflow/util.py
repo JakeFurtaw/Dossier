@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextvars
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from langchain_core.messages import BaseMessage
 
@@ -14,6 +14,10 @@ R = TypeVar("R")
 
 
 def message_text(message: BaseMessage) -> str:
+    """Readable text of a LangChain message (handles list content blocks).
+
+    Used by the ReAct loop, citation index builder, fallback tiers, and the evaluator.
+    """
     content = getattr(message, "content", "")
     if isinstance(content, str):
         return content.strip()
@@ -28,7 +32,27 @@ def message_text(message: BaseMessage) -> str:
     return str(content or "").strip()
 
 
+def is_spawn_tool(name: str) -> bool:
+    """Planner spawn tools (spawn_researcher, spawn_agents, …) run concurrently."""
+    return (name or "").startswith("spawn_")
+
+
+def invoke_tool(tool: Any, args: dict[str, Any]) -> str:
+    """Invoke a LangChain tool, returning an error string instead of raising."""
+    try:
+        result = tool.invoke(args)
+    except Exception as exc:
+        return f"Error running {getattr(tool, 'name', 'tool')}: {exc}"
+    if result is None:
+        return ""
+    return result if isinstance(result, str) else str(result)
+
+
 def thought_text(message: BaseMessage) -> str:
+    """The model's visible reasoning for a step (reasoning_content + text), for tracing.
+
+    Used by the ReAct loop when emitting Thought events.
+    """
     extra = getattr(message, "additional_kwargs", None) or {}
     reasoning = str(extra.get("reasoning_content") or extra.get("reasoning") or "").strip()
     content = message_text(message)
@@ -51,6 +75,7 @@ def run_in_threads(fn: Callable[[T], R], items: Sequence[T]) -> list[R]:
     results: list[R | None] = [None] * len(items)
 
     def _run(index: int, item: T) -> None:
+        """Pool worker: run fn(item) and stash the result at its index."""
         results[index] = fn(item)
 
     with ThreadPoolExecutor(max_workers=len(items)) as pool:

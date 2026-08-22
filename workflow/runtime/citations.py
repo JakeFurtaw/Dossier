@@ -29,16 +29,14 @@ from urllib.parse import urlsplit
 
 from langchain_core.messages import BaseMessage, ToolMessage
 
-from workflow.util import message_text
+from workflow.util import is_spawn_tool, message_text
+
 
 _URL_RE = re.compile(r"https?://[^\s\)\]<>\"'`]+")
 _SEARCH_URL_RE = re.compile(r"^\s*URL:\s*(\S+)", re.MULTILINE)
 _BROWSE_HEADER_RE = re.compile(r"###\s+Content from:\s*(\S+)")
 _NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?%?")
 _TRAILING_PUNCT = ".,;:!?)]}'\""
-
-def _is_spawn_tool(name: str) -> bool:
-    return (name or "").startswith("spawn_")
 
 
 @dataclass
@@ -67,18 +65,22 @@ class CitationAudit:
 
     @property
     def total(self) -> int:
+        """Number of cited URLs in the audit."""
         return len(self.rows)
 
     @property
     def verified_count(self) -> int:
+        """Cited URLs that appear in tool output."""
         return sum(1 for row in self.rows if row.verified)
 
     @property
     def all_verified(self) -> bool:
+        """True when every cited URL is grounded (drives CITATION_STRICT)."""
         return all(row.verified for row in self.rows)
 
     @property
     def unverified(self) -> list[CitationRow]:
+        """Cited URLs missing from tool output."""
         return [row for row in self.rows if not row.verified]
 
 
@@ -124,6 +126,7 @@ def build_evidence_index(messages: list[BaseMessage]) -> dict[str, Evidence]:
     index: dict[str, Evidence] = {}
 
     def add(url: str, source: str, body: str = "") -> None:
+        """Index (or merge) one URL under its canonical key."""
         key = normalize_url(url)
         if not key:
             return
@@ -156,13 +159,14 @@ def build_evidence_index(messages: list[BaseMessage]) -> dict[str, Evidence]:
                 first = _URL_RE.search(text)
                 if first:
                     add(first.group(0), "browse_page (no content)")
-        elif _is_spawn_tool(name):
+        elif is_spawn_tool(name):
             for url in extract_urls(text):
                 add(url, "researcher report")
     return index
 
 
 def _number_tokens(text: str) -> set[str]:
+    """Numeric tokens in text (multi-digit), for the number-grounding check."""
     tokens: set[str] = set()
     for match in _NUMBER_RE.finditer(text or ""):
         token = match.group(0).replace(",", "").rstrip("%")
@@ -172,6 +176,7 @@ def _number_tokens(text: str) -> set[str]:
 
 
 def _line_around(text: str, start: int, end: int) -> str:
+    """The line containing a [start, end) span (cited-URL number context)."""
     line_start = text.rfind("\n", 0, start) + 1
     line_end = text.find("\n", end)
     if line_end == -1:
@@ -243,6 +248,7 @@ def summarize_audit(audit: CitationAudit) -> str:
 
 
 def _cell(text: str) -> str:
+    """Escape a value for one markdown table cell."""
     return (text or "—").replace("|", "\\|")
 
 

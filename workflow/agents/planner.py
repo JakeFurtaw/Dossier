@@ -13,6 +13,7 @@ def run_planner(goal: str, recipe: Recipe | None = None) -> AgentResult:
     chosen = recipe or active_recipe()
 
     def _run() -> AgentResult:
+        """Planner ReAct loop with the recipe's tools, prompts, and max iterations."""
         return run_react(
             make_llm(role="planner"),
             planner_tools(chosen),

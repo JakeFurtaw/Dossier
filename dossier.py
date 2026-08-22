@@ -16,23 +16,11 @@ from workflow.runtime.citations import (
 )
 from workflow.runtime.replay import replay_from_path
 from workflow.runtime.tracing import start_trace
-from workflow.config import (
-    CITATION_CHECK,
-    CITATION_STRICT,
-    HOST,
-    MODEL,
-    MODEL_EVALUATOR,
-    MODEL_PLANNER,
-    MODEL_RESEARCHER,
-    NUM_PREDICT,
-    PLANNER_MAX_ITERS,
-    REPORT_DIR,
-    TEMPERATURE,
-    VERBOSE,
-)
+from workflow.config import CITATION_CHECK, CITATION_STRICT, REPORT_DIR, VERBOSE
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
+    """CLI parsing for run / replay / --list-workflows (used by main)."""
     parser = argparse.ArgumentParser(description="Run a Dossier research session.")
     parser.add_argument("goal", nargs="*", help="Research goal (default depends on --workflow).")
     parser.add_argument(
@@ -85,24 +73,14 @@ def run(
     report_dir: str,
     recipe: Recipe | None = None,
 ) -> int:
+    """One live run: start the trace bus, run the planner, audit citations."""
     chosen = recipe or get_recipe("research")
-    config = {
-        "workflow": chosen.name,
-        "model": MODEL,
-        "model_planner": MODEL_PLANNER,
-        "model_researcher": MODEL_RESEARCHER,
-        "model_evaluator": MODEL_EVALUATOR,
-        "host": HOST,
-        "temperature": TEMPERATURE,
-        "num_predict": NUM_PREDICT,
-        "planner_max_iters": PLANNER_MAX_ITERS,
-    }
     with use_recipe(chosen), start_trace(
         goal=goal,
         verbose=verbose,
         save=save,
         report_dir=report_dir,
-        config=config,
+        workflow=chosen.name,
     ) as session:
         result = run_planner(goal, recipe=chosen)
         final = result.payload if result.stop_tool == "final_answer" else ""
@@ -131,6 +109,7 @@ def run(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Entry point: dispatch to replay, --list-workflows, or a live run."""
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     if args.list_workflows:
         for recipe in list_recipes():

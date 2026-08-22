@@ -10,6 +10,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from workflow.recipes import active_recipe
 from workflow.runtime.tracing import TracePrinter
 from workflow.config import make_llm
+from workflow.util import message_text
 
 
 @dataclass
@@ -19,10 +20,12 @@ class Evaluation:
 
     @property
     def failed(self) -> bool:
+        """True when the verdict is FAIL (drives the optional researcher retry)."""
         return self.verdict == "FAIL"
 
 
 def parse_verdict(text: str) -> str:
+    """Extract PASS / WEAK / FAIL from an evaluator reply (defaults to WEAK)."""
     match = re.search(r"(?im)^\s*##\s*verdict\s*$", text or "")
     if match:
         tail = text[match.end() :]
@@ -60,13 +63,7 @@ def evaluate_findings(task: str, findings: str, parent_id: str | None = None) ->
         text = f"## Verdict\nWEAK\n\n## Issues\n- Evaluator failed: {exc}\n\n## Notes\nCould not validate."
         return Evaluation(verdict="WEAK", text=text)
 
-    content = getattr(response, "content", "")
-    if isinstance(content, list):
-        content = "\n".join(
-            block if isinstance(block, str) else str(block.get("text") or "")
-            for block in content
-        )
-    body = str(content or "").strip() or "## Verdict\nWEAK\n\n## Issues\n- Empty evaluator response."
+    body = message_text(response) or "## Verdict\nWEAK\n\n## Issues\n- Empty evaluator response."
     extra = getattr(response, "additional_kwargs", None) or {}
     reasoning = str(extra.get("reasoning_content") or "").strip()
     printer.thought(reasoning or body)

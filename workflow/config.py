@@ -6,15 +6,8 @@ import os
 
 from langchain_ollama import ChatOllama
 
-DEFAULT_GOAL = (
-    "What is the best agent framework to build a new AI Agent on in 2026? "
-    "I am looking at Langchain and Llama Index mainly, but I am open to trying others. "
-    "What are the benefits and drawbacks of each?"
-
-)
-
-
 def _env_str(name: str, default: str) -> str:
+    """Read a string env var, falling back to ``default`` when unset or blank."""
     value = os.environ.get(name)
     if value is None or not value.strip():
         return default
@@ -22,6 +15,7 @@ def _env_str(name: str, default: str) -> str:
 
 
 def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean env var (0/false/no/off are False), else ``default``."""
     value = os.environ.get(name)
     if value is None or not value.strip():
         return default

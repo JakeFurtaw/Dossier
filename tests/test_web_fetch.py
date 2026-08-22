@@ -13,11 +13,11 @@ from workflow.tools.web import (
     _fast_http_fetch,
     _fetch_page_with_playwright,
     _http_extract_or_none,
+    _hybrid_extract,
     _is_protected_or_unusable,
     _looks_like_file_url,
     _page_html_capped,
     _read_capped_body,
-    fetch_page,
     web_config,
 )
 
@@ -161,7 +161,7 @@ def test_http_extract_returns_article_and_skips_playwright(monkeypatch) -> None:
 
     monkeypatch.setattr("workflow.tools.web._fetch_page_with_playwright", boom)
     client = _client_for(handler)
-    result = asyncio.run(fetch_page("https://example.com/lisbon", http_client=client))
+    result = asyncio.run(_hybrid_extract("https://example.com/lisbon", http_client=client))
     asyncio.run(client.aclose())
     assert result.startswith("### Content from: https://example.com/lisbon")
     assert "545,796" in result
@@ -183,7 +183,7 @@ def test_http_extract_falls_back_on_thin_or_protected(monkeypatch) -> None:
 
     monkeypatch.setattr("workflow.tools.web._fetch_page_with_playwright", fake_pw)
     client = _client_for(handler)
-    result = asyncio.run(fetch_page("https://walled.example/x", http_client=client))
+    result = asyncio.run(_hybrid_extract("https://walled.example/x", http_client=client))
     asyncio.run(client.aclose())
     assert "playwright body" in result
     assert snapshot()["playwright_fallback"] == 1
@@ -236,7 +236,7 @@ def test_pdf_notice_does_not_fallback(monkeypatch) -> None:
         return httpx.Response(200, content=b"%PDF-1.4", headers={"content-type": "application/pdf"})
 
     client = _client_for(handler)
-    result = asyncio.run(fetch_page("https://x.test/a.pdf", http_client=client))
+    result = asyncio.run(_hybrid_extract("https://x.test/a.pdf", http_client=client))
     asyncio.run(client.aclose())
     assert "PDF" in result
     assert "playwright_fallback" not in snapshot()

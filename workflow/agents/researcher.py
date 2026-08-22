@@ -34,6 +34,10 @@ def researcher_user_message(
     digest: str = "",
     spec: SpecialistSpec | None = None,
 ) -> str:
+    """Compose the specialist's first user message: task + instructions + peer notes.
+
+    Used by _gather_findings before each ReAct run.
+    """
     instructions = (
         spec.user_instructions
         if spec is not None
@@ -49,6 +53,7 @@ def researcher_user_message(
 
 
 def _peer_digest(role: str) -> str:
+    """Ledger digest of what other same-role agents gathered this run (or "")."""
     bus = try_get_bus()
     if bus is None:
         return ""
@@ -56,6 +61,7 @@ def _peer_digest(role: str) -> str:
 
 
 def _publish_report(agent_id: str, role: str, task: str, text: str) -> None:
+    """Record the finished report in the shared ledger so siblings can skip it."""
     if not (text or "").strip():
         return
     bus = try_get_bus()
@@ -102,6 +108,7 @@ def _tools_for_spec(spec: SpecialistSpec) -> list[Any]:
 
 
 def _gather_findings(task: str, spec: SpecialistSpec) -> tuple[str, str, list[BaseMessage]]:
+    """Run one specialist ReAct loop; returns (report text, agent_id, messages)."""
     result = run_react(
         make_llm(role="researcher"),
         _tools_for_spec(spec),
@@ -161,6 +168,7 @@ def run_researcher(
 
 
 def _researcher_spec() -> SpecialistSpec:
+    """The active recipe's 'researcher' specialist, or the research default."""
     recipe = active_recipe()
     try:
         return recipe.specialist("researcher")
@@ -169,6 +177,7 @@ def _researcher_spec() -> SpecialistSpec:
 
 
 def _normalize_tasks(tasks: Any) -> list[str]:
+    """Coerce a spawn_researchers-style ``tasks`` argument (str/JSON/dict/list) to task strings."""
     if tasks is None:
         return []
     if isinstance(tasks, str):
@@ -199,51 +208,31 @@ def _normalize_tasks(tasks: Any) -> list[str]:
 
 
 def _run_one(spec: SpecialistSpec, assigned: str) -> str:
+    """Run one specialist, converting any exception into an error report string."""
     try:
         return run_researcher(assigned, spec=spec)
     except Exception as exc:
         return f"{spec.name} failed: {exc}"
 
 
-def run_researchers_parallel(
-    tasks: list[str],
-    spec: SpecialistSpec | None = None,
-) -> str:
-    """Run up to MAX_PARALLEL_RESEARCHERS copies of one specialist."""
-    chosen = spec or _researcher_spec()
-    cleaned = _normalize_tasks(tasks)[: max(1, MAX_PARALLEL_RESEARCHERS)]
-    if not cleaned:
-        return f"Error: spawn_{chosen.name}s requires at least one non-empty task."
-
-    bodies = run_in_threads(lambda assigned: _run_one(chosen, assigned), cleaned)
-    if len(cleaned) == 1:
-        return bodies[0]
-    label = "researcher" if chosen.name == "researcher" else chosen.name
-    parts = []
-    for index, (assigned, body) in enumerate(zip(cleaned, bodies), start=1):
-        parts.append(f"### Parallel {label} {index}\n**Task:** {assigned}\n\n{body}")
-    return "\n\n".join(parts)
-
-
-def run_specialists_parallel(pairs: list[tuple[SpecialistSpec, str]]) -> str:
-    """Run mixed specialists at the same time, capped by MAX_PARALLEL_RESEARCHERS."""
-    cleaned = [(spec, task) for spec, task in pairs if task.strip()]
+def run_agents_parallel(pairs: list[tuple[SpecialistSpec, str]]) -> str:
+    """Run up to MAX_PARALLEL_RESEARCHERS specialists at once and join the reports."""
+    cleaned = [(spec, task.strip()) for spec, task in pairs if (task or "").strip()]
     cleaned = cleaned[: max(1, MAX_PARALLEL_RESEARCHERS)]
     if not cleaned:
-        return "Error: spawn_agents requires at least one non-empty assignment."
+        return "Error: spawn requires at least one non-empty assignment."
 
-    bodies = run_in_threads(lambda item: _run_one(item[0], item[1]), cleaned)
+    bodies = run_in_threads(lambda pair: _run_one(pair[0], pair[1]), cleaned)
     if len(cleaned) == 1:
         return bodies[0]
     parts = []
     for index, ((spec, assigned), body) in enumerate(zip(cleaned, bodies), start=1):
-        parts.append(
-            f"### Parallel agent {index}\n**Agent:** {spec.name}\n**Task:** {assigned}\n\n{body}"
-        )
+        parts.append(f"### Parallel {spec.name} {index}\n**Task:** {assigned}\n\n{body}")
     return "\n\n".join(parts)
 
 
 def _normalize_assignments(raw: Any, recipe: Recipe) -> list[tuple[SpecialistSpec, str]]:
+    """Coerce spawn_agents assignments (str/JSON/dict/list of {agent, task}) to (spec, task) pairs."""
     if raw is None:
         return []
     if hasattr(raw, "agent") and hasattr(raw, "task") and not isinstance(raw, (str, dict, list, tuple)):
@@ -313,11 +302,13 @@ def planner_tools(recipe: Recipe | None = None) -> list[Any]:
 
 
 def _make_spawn_one(spec: SpecialistSpec) -> StructuredTool:
+    """Build the spawn_<specialist> tool (one task) for the planner."""
     def _run(task: str) -> str:
+        """Tool body: run the single assignment through run_agents_parallel."""
         focused = (task or "").strip()
         if not focused:
             return f"Error: spawn_{spec.name} requires a non-empty task."
-        return run_researchers_parallel([focused], spec=spec)
+        return run_agents_parallel([(spec, focused)])
 
     return StructuredTool.from_function(
         name=f"spawn_{spec.name}",
@@ -328,9 +319,11 @@ def _make_spawn_one(spec: SpecialistSpec) -> StructuredTool:
 
 
 def _make_spawn_many(spec: SpecialistSpec) -> StructuredTool:
+    """Build the batch spawn tool (e.g. spawn_researchers) for a specialist."""
     def _run(tasks: list[str]) -> str:
+        """Tool body: normalize tasks and run them in parallel."""
         try:
-            return run_researchers_parallel(tasks, spec=spec)
+            return run_agents_parallel([(spec, task) for task in _normalize_tasks(tasks)])
         except Exception as exc:
             return f"{spec.name} agents failed: {exc}"
 
@@ -343,9 +336,11 @@ def _make_spawn_many(spec: SpecialistSpec) -> StructuredTool:
 
 
 def _make_spawn_agents(recipe: Recipe) -> StructuredTool:
+    """Build spawn_agents for multi-specialist recipes (apartments)."""
     names = ", ".join(spec.name for spec in recipe.specialists)
 
     def _run(assignments: list[Any]) -> str:
+        """Tool body: normalize assignments, then run the specialists in parallel."""
         try:
             pairs = _normalize_assignments(assignments, recipe)
             if not pairs:
@@ -353,7 +348,7 @@ def _make_spawn_agents(recipe: Recipe) -> StructuredTool:
                     f"Error: spawn_agents requires assignments "
                     f"like [{{'agent': '<name>', 'task': '...'}}]. Known agents: {names}."
                 )
-            return run_specialists_parallel(pairs)
+            return run_agents_parallel(pairs)
         except Exception as exc:
             return f"Agents failed: {exc}"
 

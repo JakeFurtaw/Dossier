@@ -19,6 +19,7 @@ import logging
 import threading
 from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, List, Optional
 from urllib.parse import urlparse
 
@@ -30,6 +31,8 @@ from langchain_core.tools import tool
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 import trafilatura
+
+from workflow.runtime.metrics import record
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +134,7 @@ class BrowserPool:
     """
 
     def __init__(self) -> None:
+        """Idle until start(): loop, thread, and shared httpx client are all created there."""
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._playwright: Any = None
@@ -142,6 +146,7 @@ class BrowserPool:
         self._closed = False
 
     def start(self) -> None:
+        """Launch the worker thread and block until the loop is ready (or it failed)."""
         self._thread = threading.Thread(target=self._main, name="browser-pool", daemon=True)
         self._thread.start()
         if not self._ready.wait(timeout=45):
@@ -150,6 +155,7 @@ class BrowserPool:
             raise self._error
 
     def _main(self) -> None:
+        """Worker-thread entry: create the loop, launch infra, run it forever."""
         loop = asyncio.new_event_loop()
         self._loop = loop
         asyncio.set_event_loop(loop)
@@ -165,10 +171,12 @@ class BrowserPool:
         loop.close()
 
     async def _launch(self) -> None:
+        """Create the shared httpx client + browser lock on the pool loop."""
         self._browser_lock = asyncio.Lock()
         self._http_client = _make_http_client()
 
     async def _ensure_browser(self) -> Any:
+        """Lazily launch headless Chromium on first Playwright fallback (once)."""
         if self._browser is not None:
             return self._browser
         if self._browser_lock is None:
@@ -182,6 +190,7 @@ class BrowserPool:
             return self._browser
 
     async def _shutdown(self) -> None:
+        """Close browser, playwright driver, and httpx client."""
         if self._browser is not None:
             try:
                 await self._browser.close()
@@ -258,6 +267,7 @@ class BrowserPool:
         timeout: int | None,
         wait_until: str | None,
     ) -> str:
+        """Pool-side wrapper: ensure the browser, then render + extract."""
         browser = await self._ensure_browser()
         return await _fetch_page_with_playwright(
             url,
@@ -268,6 +278,7 @@ class BrowserPool:
         )
 
     def close(self) -> None:
+        """Stop the pool loop and join the worker thread (start_trace teardown)."""
         if self._closed:
             return
         self._closed = True
@@ -279,10 +290,12 @@ class BrowserPool:
 
 
 def get_browser_pool() -> BrowserPool | None:
+    """This thread's run-scoped pool, or None outside a run."""
     return _browser_pool.get()
 
 
 def set_browser_pool(pool: BrowserPool | None):
+    """Bind the shared pool for this context (start_trace)."""
     return _browser_pool.set(pool)
 
 
@@ -297,6 +310,7 @@ def _run_async(coro):
 
 
 def _truncate_at_sentence(text: str, max_chars: int | None = None) -> str:
+    """Cut long text at a sentence/page boundary near the cap."""
     if max_chars is None:
         max_chars = web_config.max_chars_per_page
     if len(text) <= max_chars:
@@ -312,22 +326,26 @@ def _truncate_at_sentence(text: str, max_chars: int | None = None) -> str:
 
 
 def _truncate_chars(text: str, limit: int) -> str:
+    """Hard cut with a 'N more chars' note (raw bodies)."""
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n… [{len(text) - limit} more chars truncated]"
 
 
 def _normalize_url(url: str) -> str:
+    """Prefer old.reddit.com so Reddit pages render as article HTML."""
     if "reddit.com" in url and "old.reddit.com" not in url:
         return url.replace("reddit.com", "old.reddit.com")
     return url
 
 
 def _result_url(row: dict) -> str:
+    """The URL of one DDGS result row (href or url)."""
     return (row.get("href") or row.get("url") or "").strip()
 
 
 def _extract_text(html: str) -> str:
+    """Trafilatura article extraction (fast pass, then a slower second pass)."""
     if not html or not html.strip():
         return ""
     content = trafilatura.extract(
@@ -343,15 +361,18 @@ def _extract_text(html: str) -> str:
 
 
 def _format_extract(url: str, body: str) -> str:
+    """The '### Content from: <url>' shape the citation index parses."""
     return f"### Content from: {url}\n\n{body}"
 
 
 def _looks_like_file_url(url: str) -> bool:
+    """True when the path ends in a known file suffix (skip browsing it)."""
     path = urlparse(url).path.lower()
     return any(path.endswith(suffix) for suffix in _FILE_SUFFIXES)
 
 
 def _file_notice(url: str) -> str:
+    """Extract-shaped notice for file URLs."""
     return _format_extract(
         url,
         "This URL points to a file rather than a webpage, and no extractable "
@@ -378,6 +399,7 @@ def _is_protected_or_unusable(
 
 
 def _blocked_page_message(url: str, content: str) -> str | None:
+    """'Blocked:' message when a fetched page is a bot-check wall, else None."""
     sample = (content or "").lower()
     if not any(marker in sample for marker in _BLOCKED_MARKERS):
         return None
@@ -388,6 +410,7 @@ def _blocked_page_message(url: str, content: str) -> str | None:
 
 
 def _http_client_headers() -> dict[str, str]:
+    """Browser-like request headers for the shared httpx client."""
     return {
         "User-Agent": web_config.user_agent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -404,6 +427,7 @@ def _http_client_headers() -> dict[str, str]:
 
 
 def _make_http_client(timeout: float | None = None) -> httpx.AsyncClient:
+    """An async client with the standard headers, redirects, and connection limits."""
     return httpx.AsyncClient(
         follow_redirects=True,
         timeout=timeout if timeout is not None else web_config.http_timeout,
@@ -486,20 +510,8 @@ async def _fast_http_fetch(
             await client.aclose()
 
 
-async def _http_extract_or_none(
-    url: str,
-    max_chars: int | None = None,
-    http_client: httpx.AsyncClient | None = None,
-) -> str | None:
-    """Return a formatted extract on a cheap HTTP hit, else None (caller uses Playwright).
-
-    PDF / binary / oversized responses return a notice and never trigger Playwright.
-    """
-    from workflow.runtime.metrics import record
-
-    html, status, headers, kind = await _fast_http_fetch(
-        url, timeout=web_config.http_timeout, client=http_client
-    )
+def _kind_notice(url: str, kind: str) -> str:
+    """User-facing notice for binary / pdf / oversized responses (no Playwright)."""
     if kind == "binary":
         record("http_binary_skip")
         return _format_extract(
@@ -510,10 +522,7 @@ async def _http_extract_or_none(
     if kind == "too_large":
         record("http_body_too_large")
         limit_mb = MAX_HTTP_BODY_BYTES // (1024 * 1024)
-        return _format_extract(
-            url,
-            f"This URL returned more than {limit_mb} MB and was skipped.",
-        )
+        return _format_extract(url, f"This URL returned more than {limit_mb} MB and was skipped.")
     if kind == "pdf":
         record("http_pdf_skip")
         return _format_extract(
@@ -521,6 +530,23 @@ async def _http_extract_or_none(
             "This URL is a PDF. No extractable text layer was read "
             "(open the link directly if you need the file).",
         )
+    return ""
+
+
+async def _http_extract_or_none(
+    url: str,
+    max_chars: int | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> str | None:
+    """Return a formatted extract on a cheap HTTP hit, else None (caller uses Playwright).
+
+    PDF / binary / oversized responses return a notice and never trigger Playwright.
+    """
+    html, status, headers, kind = await _fast_http_fetch(
+        url, timeout=web_config.http_timeout, client=http_client
+    )
+    if kind in ("binary", "too_large", "pdf"):
+        return _kind_notice(url, kind)
 
     blocked = _is_protected_or_unusable(html, status, headers)
     extracted = _extract_text(html) if html and not blocked else ""
@@ -544,21 +570,9 @@ async def _fetch_raw_body(url: str, http_client: httpx.AsyncClient | None = None
     html, status, _headers, kind = await _fast_http_fetch(
         url, timeout=web_config.http_timeout, client=http_client
     )
-    if kind == "binary":
-        return _format_extract(
-            url,
-            "This URL is a binary file (not text), so no raw body was retrieved. "
-            "Open the link directly if you need the file.",
-        )
-    if kind == "too_large":
-        limit_mb = MAX_HTTP_BODY_BYTES // (1024 * 1024)
-        return _format_extract(url, f"This URL returned more than {limit_mb} MB and was skipped.")
-    if kind == "pdf":
-        return _format_extract(
-            url,
-            "This URL is a PDF. No raw text was read "
-            "(open the link directly if you need the file).",
-        )
+    notice = _kind_notice(url, kind)
+    if notice:
+        return notice
     if not html:
         status_txt = f" (HTTP {status})" if status else ""
         return (
@@ -583,12 +597,7 @@ async def _page_html_capped(page: Any) -> str:
         size = 0
     if size and int(size) > MAX_HTTP_BODY_BYTES:
         logger.info("Playwright DOM is %s chars; taking innerText instead of full HTML", size)
-        try:
-            from workflow.runtime.metrics import record
-
-            record("dom_capped")
-        except Exception:
-            pass
+        record("dom_capped")
         try:
             return (await page.evaluate("() => document.body ? document.body.innerText : ''")) or ""
         except Exception:
@@ -602,18 +611,12 @@ async def _page_html_capped(page: Any) -> str:
     return html or ""
 
 
-async def fetch_page(
+async def _hybrid_extract(
     url: str,
     max_chars: Optional[int] = None,
-    timeout: Optional[int] = None,
-    browser: Optional[Any] = None,
-    wait_until: Optional[str] = None,
     http_client: Optional[httpx.AsyncClient] = None,
 ) -> str:
     """Hybrid fetch: cheap httpx first, Playwright only if that is not usable."""
-    if timeout is None:
-        timeout = web_config.browser_timeout
-
     url = _normalize_url(url)
     http_result = await _http_extract_or_none(url, max_chars, http_client=http_client)
     if http_result is not None:
@@ -621,15 +624,11 @@ async def fetch_page(
     if _looks_like_file_url(url):
         return _file_notice(url)
 
-    from workflow.runtime.metrics import record
-
     record("playwright_fallback")
     return await _fetch_page_with_playwright(
         url,
         max_chars=max_chars,
-        timeout=timeout,
-        browser=browser,
-        wait_until=wait_until,
+        timeout=web_config.browser_timeout,
     )
 
 
@@ -641,6 +640,7 @@ async def _fetch_page_with_playwright(
     wait_until: Optional[str] = None,
     context: Optional[Any] = None,
 ) -> str:
+    """Render the page in isolated Playwright and extract text (last-resort fetch)."""
     if timeout is None:
         timeout = web_config.browser_timeout
 
@@ -764,6 +764,7 @@ def sync_search(query: str, max_results: int | None = None) -> List[dict]:
 
 
 def _format_search_results(query: str, rows: list[dict]) -> str:
+    """Render DDGS rows as the numbered 'URL:' list researchers parse."""
     if not rows:
         return (
             f'No search results found for "{query}". '
@@ -788,6 +789,7 @@ def _format_search_results(query: str, rows: list[dict]) -> str:
 
 
 def _run_search(query: str, max_results: int) -> str:
+    """One DDGS search + formatting (no caching; web_search wraps that)."""
     try:
         rows = sync_search(query, max_results=max_results)
     except Exception as exc:
@@ -813,31 +815,15 @@ def web_search(query: str, max_results: int = 5) -> str:
     if bus is None:
         return _run_search(q, n)
 
-    cached = bus.get_cached_search(q, n)
-    if cached is not None:
-        from workflow.runtime.metrics import record
-
-        record("search_cache_hit")
-        return cached
-
-    owned = bus.acquire_search(q, n)
-    if not owned:
+    get_cached = partial(bus.get_cached_search, q, n)
+    if (hit := _cached(get_cached, "search_cache_hit")) is not None:
+        return hit
+    if not bus.acquire_search(q, n):
         bus.wait_search(q, n)
-        cached = bus.get_cached_search(q, n)
-        if cached is not None:
-            from workflow.runtime.metrics import record
-
-            record("search_cache_hit")
-            return cached
+        if (hit := _cached(get_cached, "search_cache_hit")) is not None:
+            return hit
         return _run_search(q, n)
-
     try:
-        cached = bus.get_cached_search(q, n)
-        if cached is not None:
-            from workflow.runtime.metrics import record
-
-            record("search_cache_hit")
-            return cached
         result = _run_search(q, n)
         bus.put_cached_search(q, n, result)
         if not result.startswith(("Error:", "Search failed:")):
@@ -860,23 +846,16 @@ def browse_page(url: str, instructions: str = "") -> str:
     if not target.startswith(("http://", "https://")):
         return "Error: browse_page requires a valid full http(s) URL."
 
-    cached = _cache_get(target)
-    if cached is not None:
-        from workflow.runtime.metrics import record
-
-        record("url_cache_hit")
-        return _with_focus(cached, instructions)
+    get_cached = partial(_cache_get, target)
+    if (hit := _cached(get_cached, "url_cache_hit")) is not None:
+        return _with_focus(hit, instructions)
 
     bus = _trace_bus()
     owned = bus.acquire_url_fetch(target) if bus is not None else True
     if bus is not None and not owned:
         bus.wait_url_fetch(target)
-        cached = _cache_get(target)
-        if cached is not None:
-            from workflow.runtime.metrics import record
-
-            record("url_cache_hit")
-            return _with_focus(cached, instructions)
+        if (hit := _cached(get_cached, "url_cache_hit")) is not None:
+            return _with_focus(hit, instructions)
 
     try:
         content = _fetch_page_sync(target)
@@ -888,8 +867,6 @@ def browse_page(url: str, instructions: str = "") -> str:
     try:
         blocked = _blocked_page_message(target, content)
         if blocked:
-            from workflow.runtime.metrics import record
-
             record("blocked_page")
             _cache_put(target, blocked)
             _publish_browse(bus, target, blocked=True)
@@ -915,23 +892,16 @@ def fetch_raw(url: str) -> str:
     if not target.startswith(("http://", "https://")):
         return "Error: fetch_raw requires a valid full http(s) URL."
 
-    cached = _cache_get(target, kind="raw")
-    if cached is not None:
-        from workflow.runtime.metrics import record
-
-        record("url_cache_hit")
-        return cached
+    get_cached = partial(_cache_get, target, kind="raw")
+    if (hit := _cached(get_cached, "url_cache_hit")) is not None:
+        return hit
 
     bus = _trace_bus()
     owned = bus.acquire_url_fetch(target, kind="raw") if bus is not None else True
     if bus is not None and not owned:
         bus.wait_url_fetch(target, kind="raw")
-        cached = _cache_get(target, kind="raw")
-        if cached is not None:
-            from workflow.runtime.metrics import record
-
-            record("url_cache_hit")
-            return cached
+        if (hit := _cached(get_cached, "url_cache_hit")) is not None:
+            return hit
 
     try:
         content = _fetch_raw_sync(target)
@@ -979,8 +949,6 @@ def _fetch_page_sync(url: str) -> str:
     if _looks_like_file_url(url):
         return _file_notice(url)
 
-    from workflow.runtime.metrics import record
-
     record("playwright_fallback")
     if pool is not None:
         return pool.fetch(url, max_chars=web_config.max_chars_per_page, timeout=45)
@@ -992,13 +960,24 @@ def _fetch_page_sync(url: str) -> str:
 
 
 def _with_focus(content: str, instructions: str) -> str:
+    """Prepend the requested focus when browse_page was called with one."""
     focus = (instructions or "").strip()
     if focus:
         return f"Focus requested: {focus}\n\n{content}"
     return content
 
 
+def _cached(getter, hit: str) -> str | None:
+    """Cached value for this key (counting the hit), or None."""
+    value = getter()
+    if value is not None:
+        record(hit)
+        return value
+    return None
+
+
 def _cache_get(url: str, kind: str = "page") -> str | None:
+    """Bus URL-cache lookup (None outside a run)."""
     bus = _trace_bus()
     if bus is None:
         return None
@@ -1006,6 +985,7 @@ def _cache_get(url: str, kind: str = "page") -> str | None:
 
 
 def _cache_put(url: str, content: str, kind: str = "page") -> None:
+    """Store a fetched body in the run's URL cache."""
     bus = _trace_bus()
     if bus is None:
         return
@@ -1013,6 +993,7 @@ def _cache_put(url: str, content: str, kind: str = "page") -> None:
 
 
 def _publish_search(bus, query: str, result: str) -> None:
+    """Ledger note for a successful search (feeds peer digests)."""
     from workflow.runtime.citations import extract_urls
     from workflow.runtime.ledger import LedgerEntry
     from workflow.runtime.tracing import current_agent
@@ -1031,6 +1012,7 @@ def _publish_search(bus, query: str, result: str) -> None:
 
 
 def _publish_browse(bus, url: str, *, blocked: bool) -> None:
+    """Ledger note for a page fetch (blocked or not)."""
     if bus is None:
         return
     from workflow.runtime.ledger import LedgerEntry
@@ -1050,11 +1032,9 @@ def _publish_browse(bus, url: str, *, blocked: bool) -> None:
 
 
 def _trace_bus():
+    """The active run bus, or None outside start_trace (see web_search/browse_page)."""
     # Lazy import: start_trace owns the pool and would otherwise cycle with this module.
     # Read the ContextVar directly so we do not create the process-wide fallback bus.
-    try:
-        from workflow.runtime.tracing import try_get_bus
+    from workflow.runtime.tracing import try_get_bus
 
-        return try_get_bus()
-    except Exception:
-        return None
+    return try_get_bus()

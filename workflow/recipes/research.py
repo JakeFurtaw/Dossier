@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-from workflow.config import DEFAULT_GOAL
 from workflow.recipes.types import Recipe, SpecialistSpec
+
+DEFAULT_GOAL = (
+    "What is the best agent framework to build a new AI Agent on in 2026? "
+    "I am looking at Langchain and Llama Index mainly, but I am open to trying others. "
+    "What are the benefits and drawbacks of each?"
+)
 
 PLANNER_SYSTEM = """You are the planner agent in a multi-agent research system.
 

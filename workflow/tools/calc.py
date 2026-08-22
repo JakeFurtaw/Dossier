@@ -32,6 +32,7 @@ def evaluate_expression(expression: str) -> Number:
 
 
 def _eval_node(node: ast.AST) -> Number:
+    """Evaluate one whitelisted AST node; raises ValueError on anything else."""
     if isinstance(node, ast.Expression):
         return _eval_node(node.body)
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(

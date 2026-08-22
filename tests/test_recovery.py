@@ -142,6 +142,6 @@ def test_usable_synthesis_rejects_planning_chatter() -> None:
 
 def test_should_fallback_early() -> None:
     reports = [ToolMessage(content="ok", tool_call_id="1", name="spawn_researcher")]
-    assert should_fallback_early("planner", {"final_answer"}, reports)
-    assert not should_fallback_early("planner", {"final_answer"}, [])
-    assert not should_fallback_early("researcher", {"report_findings"}, reports)
+    assert should_fallback_early({"final_answer"}, reports)
+    assert not should_fallback_early({"final_answer"}, [])
+    assert not should_fallback_early({"report_findings"}, reports)

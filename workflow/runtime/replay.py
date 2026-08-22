@@ -136,6 +136,7 @@ def tool_messages_from_events(events: list[TraceEvent]) -> list[ToolMessage]:
 
 
 def _split_sections(text: str) -> dict[str, str]:
+    """Split a saved report into its top-level '## ' sections (header under "")."""
     sections: dict[str, list[str]] = {"": []}
     current = ""
     for line in text.splitlines():
@@ -153,6 +154,7 @@ def _split_sections(text: str) -> dict[str, str]:
 
 
 def _parse_header(header: str, run: ReplayRun) -> None:
+    """Recover the '- **Key:** value' metadata lines into ReplayRun.config/reason."""
     for line in header.splitlines():
         match = _META_RE.match(line)
         if not match:
@@ -176,6 +178,7 @@ def _parse_header(header: str, run: ReplayRun) -> None:
 
 
 def _parse_trace(trace: str) -> list[TraceEvent]:
+    """Parse the '## Trace' section back into ordered TraceEvents."""
     events: list[TraceEvent] = []
     agent_id = ""
     role = ""
@@ -289,6 +292,7 @@ _BODY_STOP = (
 
 
 def _is_boundary(line: str) -> bool:
+    """True when a trace line ends the current event body."""
     if _HEADING_RE.match(line) or _SPAWN_RE.match(line) or _FINISH_RE.match(line):
         return True
     if _NOTE_RE.match(line):
@@ -303,6 +307,7 @@ def _is_boundary(line: str) -> bool:
 
 
 def _take_body(lines: list[str], start: int) -> tuple[str, int]:
+    """Collect a Thought/Observation body up to the next boundary; un-escape fences."""
     i = start
     if i < len(lines) and lines[i].strip() == "":
         i += 1
@@ -315,6 +320,7 @@ def _take_body(lines: list[str], start: int) -> tuple[str, int]:
 
 
 def _take_json_args(lines: list[str], start: int) -> tuple[dict[str, Any], int]:
+    """Read the ```json args block of an Action line ({} on parse failure)."""
     i = start
     while i < len(lines) and lines[i].strip() == "":
         i += 1

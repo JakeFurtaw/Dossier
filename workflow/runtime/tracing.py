@@ -20,7 +20,7 @@ from typing import Any, Iterator
 from workflow.config import HOST, MODEL, MODEL_EVALUATOR, MODEL_PLANNER, MODEL_RESEARCHER, NUM_PREDICT, OBS_TRUNCATE, REPORT_DIR, TEMPERATURE
 from workflow.runtime.ledger import LedgerEntry, SharedContext
 from workflow.runtime.metrics import Counters, install_counters, snapshot, uninstall_counters
-from workflow.runtime.report import TraceEvent, write_reports
+from workflow.runtime.report import TraceEvent, write_report
 
 logger = logging.getLogger(__name__)
 
@@ -28,17 +28,8 @@ _current: ContextVar[TraceBus | None] = ContextVar("trace_bus", default=None)
 _agent_stack: ContextVar[tuple[str, ...]] = ContextVar("agent_stack", default=())
 _fallback: TraceBus | None = None
 
-_ROLE_COLOR = {
-    "planner": "cyan",
-    "researcher": "magenta",
-    "evaluator": "green",
-    "listing": "yellow",
-    "geo": "blue",
-    "amenities": "bright_magenta",
-}
-
-
 def _role_color(role: str) -> str:
+    """Console color for an agent role from the active recipe (white fallback)."""
     try:
         from workflow.recipes import active_recipe
 
@@ -47,10 +38,11 @@ def _role_color(role: str) -> str:
             return color
     except Exception:
         pass
-    return _ROLE_COLOR.get(role, "white")
+    return "white"
 
 
 def _preview(text: str, limit: int, verbose: bool) -> str:
+    """Truncate long text for panels; tells the reader where the rest lives."""
     text = text or ""
     if verbose or len(text) <= limit:
         return text
@@ -59,6 +51,7 @@ def _preview(text: str, limit: int, verbose: bool) -> str:
 
 
 def _one_line(text: str, limit: int = 88) -> str:
+    """Collapse whitespace to a single bounded line (compact action rows)."""
     line = " ".join((text or "").split())
     if len(line) <= limit:
         return line
@@ -66,6 +59,7 @@ def _one_line(text: str, limit: int = 88) -> str:
 
 
 def _observation_summary(text: str) -> str:
+    """One-line verdict for a tool output (verdict, hits, blocked, N reports, size)."""
     match = re.search(r"\*\*Verdict:\*\*\s*(PASS|WEAK|FAIL)", text or "", flags=re.I)
     if match:
         return f"evaluator {match.group(1).upper()}"
@@ -74,14 +68,14 @@ def _observation_summary(text: str) -> str:
         return f"{match.group(1)} search hits"
     if (text or "").startswith("Blocked:"):
         return "page blocked"
-    if "Parallel researcher" in (text or "") or "Parallel agent" in (text or ""):
-        n = (text or "").count("### Parallel researcher") + (text or "").count("### Parallel agent")
-        return f"{n or 1} parallel report(s)"
+    if "### Parallel" in (text or ""):
+        return f"{(text or '').count('### Parallel') or 1} parallel report(s)"
     chars = len(text or "")
     return f"ok · {chars} chars"
 
 
 def _tool_detail(name: str, args: dict[str, Any]) -> str:
+    """'tool · short-arg' label for compact action rows and the live tree."""
     for key in ("query", "url", "task", "expression"):
         value = args.get(key)
         if isinstance(value, str) and value.strip():
@@ -106,6 +100,7 @@ class AgentNode:
 
     @property
     def busy(self) -> bool:
+        """True while the agent is mid-thought / acting / waiting on a child."""
         return self.status in {"thinking", "acting", "waiting"}
 
 
@@ -113,18 +108,23 @@ class TraceListener:
     """Optional subscriber. Override the hooks you care about."""
 
     def on_start(self, bus: TraceBus) -> None:
+        """Run starting (before any events)."""
         return None
 
     def on_event(self, bus: TraceBus, event: TraceEvent) -> None:
+        """One thought/action/observation/note/spawn/finish event."""
         return None
 
     def on_tree(self, bus: TraceBus) -> None:
+        """Agent tree changed; re-render status if wanted."""
         return None
 
     def on_complete(self, bus: TraceBus, citation_summary: str = "") -> None:
+        """Run finished; optional one-line citation verdict available."""
         return None
 
     def on_stop(self, bus: TraceBus) -> None:
+        """Bus torn down (always last)."""
         return None
 
 
@@ -140,6 +140,7 @@ class TraceBus:
         report_dir: str | Path = REPORT_DIR,
         config: dict[str, Any] | None = None,
     ) -> None:
+        """Configure one run: goal, save behavior, default report metadata."""
         self.goal = goal
         self.verbose = verbose
         self.save = save
@@ -168,16 +169,20 @@ class TraceBus:
         self._completed = False
 
     def subscribe(self, listener: TraceListener) -> None:
+        """Register a subscriber (RichRenderer, or tests / a future web UI)."""
         self._listeners.append(listener)
 
     def _notify(self, method: str, *args: Any) -> None:
+        """Fan out one hook to all subscribers."""
         for listener in list(self._listeners):
             getattr(listener, method)(self, *args)
 
     def start(self) -> None:
+        """Signal 'run started' (renderer shows header + live tree)."""
         self._notify("on_start")
 
     def stop(self) -> None:
+        """Signal 'run ended' (renderer stops the live view)."""
         self._notify("on_stop")
 
     def complete(
@@ -188,12 +193,13 @@ class TraceBus:
         citation_audit_md: str = "",
         citation_summary: str = "",
     ) -> None:
+        """End the run: record final/reason, write the report once, notify listeners."""
         self.final = final or self.final
         self.reason = reason or self.reason
         self.citation_audit_md = citation_audit_md or self.citation_audit_md
         self._notify("on_tree")
         if self.save and not self._completed:
-            self._write_reports()
+            self._write_report()
         self._completed = True
         self._notify("on_complete", citation_summary)
 
@@ -203,6 +209,7 @@ class TraceBus:
         max_iterations: int = 0,
         parent_id: str | None = None,
     ) -> str:
+        """Create this thread's agent node (nested under the current one) and emit spawn."""
         with self._lock:
             n = self._role_counts.get(role, 0) + 1
             self._role_counts[role] = n
@@ -216,6 +223,7 @@ class TraceBus:
         return agent_id
 
     def end_agent(self, agent_id: str, reason: str) -> None:
+        """Mark the agent done, detach it from the thread stack, emit finish."""
         with self._lock:
             node = self.nodes.get(agent_id)
             self._mark_done(agent_id, reason)
@@ -234,6 +242,7 @@ class TraceBus:
         )
 
     def set_step(self, agent_id: str, step: int) -> None:
+        """Advance an agent's step counter (live tree + report headings)."""
         with self._lock:
             node = self.nodes.get(agent_id)
             if node:
@@ -242,6 +251,7 @@ class TraceBus:
 
     @contextmanager
     def thinking(self, agent_id: str) -> Iterator[None]:
+        """Mark the agent as thinking (on Ollama) for the span's duration."""
         node = self.nodes.get(agent_id)
         if node:
             node.status = "thinking"
@@ -257,6 +267,7 @@ class TraceBus:
 
     @contextmanager
     def acting(self, agent_id: str, tool: str, args: dict[str, Any]) -> Iterator[None]:
+        """Mark the agent as acting (with tool detail) for the span's duration."""
         node = self.nodes.get(agent_id)
         if node:
             node.status = "acting"
@@ -270,53 +281,69 @@ class TraceBus:
                 self._notify("on_tree")
 
     def thought(self, agent_id: str, role: str, step: int, text: str) -> None:
+        """Record a Thought event for the trace + report."""
         self._emit(TraceEvent(kind="thought", role=role, agent_id=agent_id, step=step, text=text))
 
     def action(self, agent_id: str, role: str, step: int, name: str, args: dict[str, Any]) -> None:
+        """Record an Action (tool call) event."""
         self._emit(
             TraceEvent(kind="action", role=role, agent_id=agent_id, step=step, tool=name, args=args)
         )
 
     def observation(self, agent_id: str, role: str, step: int, text: str) -> None:
+        """Record a tool's Observation event."""
         self._emit(TraceEvent(kind="observation", role=role, agent_id=agent_id, step=step, text=text))
 
     def note(self, agent_id: str, role: str, step: int, text: str) -> None:
+        """Record a short diagnostic Note event (fallbacks, LLM errors, …)."""
         self._emit(TraceEvent(kind="note", role=role, agent_id=agent_id, step=step, text=text))
 
     def get_cached_url(self, url: str, kind: str = "page") -> str | None:
+        """Cached page body for this run (web.py hit path)."""
         return self.shared.get_url(url, kind=kind)
 
     def put_cached_url(self, url: str, content: str, kind: str = "page") -> None:
+        """Cache a fetched page body."""
         self.shared.put_url(url, content, kind=kind)
 
     def get_cached_search(self, query: str, max_results: int) -> str | None:
+        """Cached web_search result."""
         return self.shared.get_search(query, max_results)
 
     def put_cached_search(self, query: str, max_results: int, content: str) -> None:
+        """Cache a web_search result."""
         self.shared.put_search(query, max_results, content)
 
     def acquire_search(self, query: str, max_results: int) -> bool:
+        """True when this thread may run the search (see SharedContext)."""
         return self.shared.acquire_search(query, max_results)
 
     def wait_search(self, query: str, max_results: int, timeout: float = 90.0) -> None:
+        """Wait on another thread's in-flight run of the same search."""
         self.shared.wait_search(query, max_results, timeout=timeout)
 
     def release_search(self, query: str, max_results: int) -> None:
+        """Finish a search and wake its waiters."""
         self.shared.release_search(query, max_results)
 
     def acquire_url_fetch(self, url: str, kind: str = "page") -> bool:
+        """True when this thread may fetch the URL (see SharedContext)."""
         return self.shared.acquire_url(url, kind=kind)
 
     def wait_url_fetch(self, url: str, timeout: float = 60.0, kind: str = "page") -> None:
+        """Wait on another thread's in-flight fetch of the same URL."""
         self.shared.wait_url(url, timeout=timeout, kind=kind)
 
     def release_url_fetch(self, url: str, kind: str = "page") -> None:
+        """Finish a URL fetch and wake its waiters."""
         self.shared.release_url(url, kind=kind)
 
     def publish_entry(self, entry: LedgerEntry) -> None:
+        """Add a ledger note (report/search/browse) for peer digests."""
         self.shared.publish(entry)
 
     def peer_digest(self, role: str, *, exclude_agent: str = "") -> str:
+        """'Already gathered by other agents' block for a specialist's prompt."""
         return self.shared.digest(role, exclude_agent=exclude_agent)
 
     def ingest_event(self, event: TraceEvent) -> None:
@@ -357,6 +384,7 @@ class TraceBus:
         self._notify("on_tree")
 
     def depth(self, agent_id: str) -> int:
+        """Tree depth of an agent (used for console indentation)."""
         node = self.nodes.get(agent_id)
         return node.depth if node else 0
 
@@ -368,6 +396,7 @@ class TraceBus:
         max_iterations: int = 0,
         parent_id: str | None = None,
     ) -> AgentNode:
+        """Create a node and attach it under its parent (or as a root)."""
         node = AgentNode(agent_id=agent_id, role=role, max_iterations=max_iterations)
         parent = self.nodes.get(parent_id) if parent_id else None
         if parent:
@@ -382,6 +411,7 @@ class TraceBus:
         return node
 
     def _mark_done(self, agent_id: str, reason: str) -> None:
+        """Mark an agent done and resume its parent's status when all children finish."""
         node = self.nodes.get(agent_id)
         if node:
             node.status = "done"
@@ -402,6 +432,7 @@ class TraceBus:
                     )
 
     def _replay_parent(self, role: str) -> str | None:
+        """Best-effort parent for a replayed event (planner roots itself)."""
         if role == "planner":
             return None
         if role == "evaluator":
@@ -417,15 +448,17 @@ class TraceBus:
         return None
 
     def _emit(self, event: TraceEvent) -> None:
+        """Append an event and notify listeners (event + tree)."""
         with self._lock:
             self.events.append(event)
         self._notify("on_event", event)
         self._notify("on_tree")
 
-    def _write_reports(self) -> None:
+    def _write_report(self) -> None:
+        """Serialize this run to runs/<timestamp>.md (called once by complete)."""
         ended = datetime.now().astimezone()
         stem = self.started.strftime("%Y%m%d-%H%M%S")
-        self.report_path = write_reports(
+        self.report_path = write_report(
             self.report_dir,
             stem,
             goal=self.goal,
@@ -445,9 +478,10 @@ class RichRenderer(TraceListener):
     """Live Rich tree + Thought / Action / Observation panels."""
 
     def __init__(self, bus: TraceBus, *, verbose: bool = False) -> None:
+        """Attach a listener to the bus (imports Rich here so tests stay console-free)."""
         # Imported here so TraceBus (and tests / a future SSE frontend) have
         # no console dependency at import time.
-        from rich.console import Console, Group, RenderableType
+        from rich.console import Console, Group
         from rich.live import Live
         from rich.markdown import Markdown
         from rich.padding import Padding
@@ -474,6 +508,7 @@ class RichRenderer(TraceListener):
         bus.subscribe(self)
 
     def on_start(self, bus: TraceBus) -> None:
+        """Print the header panel and start the live agent tree."""
         goal_preview = bus.goal.strip() or "(no goal)"
         header = self._Group(
             self._Text.from_markup(
@@ -501,17 +536,20 @@ class RichRenderer(TraceListener):
         self._live.start()
 
     def on_stop(self, bus: TraceBus) -> None:
+        """Stop the live view."""
         del bus
         if self._live is not None:
             self._live.stop()
             self._live = None
 
     def on_tree(self, bus: TraceBus) -> None:
+        """Refresh the live agent tree."""
         del bus
         if self._live is not None:
             self._live.update(self._status_renderable())
 
     def on_event(self, bus: TraceBus, event: TraceEvent) -> None:
+        """Render one event below the live tree (depth-indented when verbose)."""
         renderable = self._render_event(bus, event)
         if renderable is None:
             return
@@ -523,6 +561,7 @@ class RichRenderer(TraceListener):
         self._print(out)
 
     def on_complete(self, bus: TraceBus, citation_summary: str = "") -> None:
+        """End of run: citation line, final-answer panel (or graceful exit), report path."""
         self.on_stop(bus)
         if citation_summary:
             if "unverified:" in citation_summary:
@@ -554,6 +593,7 @@ class RichRenderer(TraceListener):
             self.console.print(f"[dim]Saved report:[/] {bus.report_path}")
 
     def _render_event(self, bus: TraceBus, event: TraceEvent):
+        """One TraceEvent → Rich renderable (or None when hidden at this verbosity)."""
         color = _role_color(event.role)
         if event.kind == "thought":
             if not self.verbose:
@@ -614,10 +654,12 @@ class RichRenderer(TraceListener):
         return None
 
     def _print(self, renderable) -> None:
+        """Print below the live view (or to the console when it is not running)."""
         console = self._live.console if self._live is not None else self.console
         console.print(renderable)
 
     def _status_renderable(self):
+        """The live 'agent tree' panel (elapsed time + per-agent status)."""
         elapsed = max((datetime.now().astimezone() - self.bus.started).total_seconds(), 0.0)
         title = f"{self.bus.config.get('model', 'ollama')}  ·  {elapsed:.0f}s"
         tree = self._Tree(self._Text(title, style="bold bright_blue"))
@@ -628,6 +670,7 @@ class RichRenderer(TraceListener):
         return self._Panel(tree, title="Live agents", border_style="bright_blue", padding=(0, 1))
 
     def _add_node(self, tree, node: AgentNode) -> None:
+        """Recursively render one agent + children (spinner while busy)."""
         color = _role_color(node.role)
         cap = f"{node.step}/{node.max_iterations}" if node.max_iterations else str(node.step or "–")
         detail = node.activity or node.status
@@ -652,6 +695,7 @@ class TracePrinter:
         max_iterations: int = 0,
         parent_id: str | None = None,
     ) -> None:
+        """Claim an agent node on the bus; constructed by run_react and the evaluator."""
         self.role = role
         self.session = get_bus()
         self.agent_id = self.session.start_agent(
@@ -660,30 +704,38 @@ class TracePrinter:
         self.step = 0
 
     def next_step(self) -> int:
+        """Advance to the next ReAct step."""
         self.step += 1
         self.session.set_step(self.agent_id, self.step)
         return self.step
 
     def thinking(self):
+        """Bus span marking this agent as thinking."""
         return self.session.thinking(self.agent_id)
 
     def acting(self, tool: str, args: dict[str, Any]):
+        """Bus span marking this agent as running a tool."""
         return self.session.acting(self.agent_id, tool, args)
 
     def thought(self, text: str) -> None:
+        """Emit the step's Thought (reasoning + visible text)."""
         self.session.thought(self.agent_id, self.role, self.step, text.strip() or "(no explicit thought)")
 
     def action(self, name: str, args: Any) -> None:
+        """Emit the step's Action (tool + args)."""
         payload = args if isinstance(args, dict) else {"value": args}
         self.session.action(self.agent_id, self.role, self.step, name, payload)
 
     def observation(self, text: str) -> None:
+        """Emit the step's Observation (tool output)."""
         self.session.observation(self.agent_id, self.role, self.step, text)
 
     def note(self, text: str) -> None:
+        """Emit a diagnostic Note."""
         self.session.note(self.agent_id, self.role, self.step, text)
 
     def finish(self, reason: str) -> None:
+        """Close the agent's node with its stop reason."""
         self.session.end_agent(self.agent_id, reason)
 
 
@@ -693,6 +745,7 @@ def try_get_bus() -> TraceBus | None:
 
 
 def get_bus() -> TraceBus:
+    """Active run bus, or a process-wide fallback so tracing never crashes."""
     session = try_get_bus()
     if session is not None:
         return session
@@ -720,19 +773,24 @@ def start_trace(
     save: bool = True,
     report_dir: str | Path = REPORT_DIR,
     config: dict[str, Any] | None = None,
+    workflow: str = "",
     render: bool = True,
     browser: bool = True,
 ) -> Iterator[TraceBus]:
+    """Own one run: counters + bus (+ renderer, browser pool), torn down on exit."""
     from workflow.tools.web import BrowserPool, set_browser_pool
 
     counters = Counters()
     counters_token = install_counters(counters)
+    merged = dict(config or {})
+    if workflow:
+        merged["workflow"] = workflow
     bus = TraceBus(
         goal=goal,
         verbose=verbose,
         save=save,
         report_dir=report_dir,
-        config=config,
+        config=merged or None,
     )
     if render:
         RichRenderer(bus, verbose=verbose)
@@ -765,6 +823,7 @@ def start_trace(
 
 
 def _browser_pool_reset(token) -> None:
+    """Undo the run's shared BrowserPool ContextVar binding (start_trace teardown)."""
     from workflow.tools.web import _browser_pool
 
     try:

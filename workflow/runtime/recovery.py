@@ -11,6 +11,7 @@ role's list — no hunting through react.py.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -18,13 +19,10 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 
 from workflow.config import make_llm
 from workflow.runtime.metrics import record
-from workflow.util import message_text, thought_text
+from workflow.util import invoke_tool, is_spawn_tool, message_text, thought_text
 
 _USEFUL_TOOLS = {"web_search", "browse_page", "fetch_raw"}
 
-
-def _is_spawn_tool(name: str) -> bool:
-    return (name or "").startswith("spawn_")
 _BLOCKED_MARKERS = (
     "blocked:",
     "captcha",
@@ -49,6 +47,7 @@ def _tool_chunks(
     *,
     headed: bool = False,
 ) -> list[str]:
+    """Collect the usable (non-error, non-blocked) outputs of the named tools, truncated."""
     chunks: list[str] = []
     for message in messages:
         if not isinstance(message, ToolMessage):
@@ -66,19 +65,20 @@ def _tool_chunks(
 
 
 def compile_researcher_reports(messages: Iterable[BaseMessage], limit: int = 12000) -> str:
+    """Join all spawn_* observations (researcher reports) in one message blob."""
     collected = list(messages)
     names = {
         getattr(message, "name", "") or ""
         for message in collected
-        if _is_spawn_tool(getattr(message, "name", "") or "")
+        if is_spawn_tool(getattr(message, "name", "") or "")
     }
     if not names:
         return ""
     return "\n\n---\n\n".join(_tool_chunks(collected, names, limit))
 
 
-def planner_fallback_answer(messages: Iterable[BaseMessage], goal: str = "") -> str:
-    del goal
+def planner_fallback_answer(messages: Iterable[BaseMessage]) -> str:
+    """Raw-evidence final answer assembled from researcher reports (planner fallback tier)."""
     reports = compile_researcher_reports(messages)
     if not reports:
         return ""
@@ -89,6 +89,7 @@ def planner_fallback_answer(messages: Iterable[BaseMessage], goal: str = "") -> 
 
 
 def researcher_fallback(messages: Iterable[BaseMessage], reason: str) -> str:
+    """Compiled evidence dump for a researcher that never called report_findings."""
     notes = "\n\n".join(_tool_chunks(messages, _USEFUL_TOOLS, 2500, headed=True))
     if not notes:
         return f"Researcher stopped without findings ({reason})."
@@ -144,20 +145,11 @@ def _usable_synthesis(text: str) -> bool:
     return True
 
 
-def _invoke_tool(tool: Any, args: dict[str, Any]) -> str:
-    try:
-        result = tool.invoke(args)
-    except Exception as exc:
-        return f"Error running {getattr(tool, 'name', 'tool')}: {exc}"
-    if result is None:
-        return ""
-    return result if isinstance(result, str) else str(result)
-
-
 def _commit_final_answer(tool: Any, answer: str, tracer: Any) -> str | None:
+    """Submit prose through the final_answer tool with trace action/observation spans."""
     if tracer is not None:
         tracer.action("final_answer", {"answer": answer})
-    observation = _invoke_tool(tool, {"answer": answer})
+    observation = invoke_tool(tool, {"answer": answer})
     if tracer is not None:
         tracer.observation(observation)
     if observation and not observation.startswith("Error:"):
@@ -175,9 +167,11 @@ class PlannerLlmSynthesis:
     name = "planner.llm_synthesis"
 
     def applies(self, ctx: FallbackContext) -> bool:
+        """Planner run with at least one researcher report to synthesize from."""
         return "final_answer" in ctx.stop_tools and bool(compile_researcher_reports(ctx.messages))
 
     def try_recover(self, ctx: FallbackContext) -> FallbackOutcome | None:
+        """One no-tools LLM write of the answer, then commit via final_answer."""
         tool = (ctx.tool_map or {}).get("final_answer")
         reports = compile_researcher_reports(ctx.messages)
         if tool is None or not reports:
@@ -200,7 +194,7 @@ class PlannerLlmSynthesis:
         if tracer is not None:
             tracer.note("Writing final_answer from researcher reports (no tool call from planner).")
         try:
-            thinking = tracer.thinking() if tracer is not None else _null_cm()
+            thinking = tracer.thinking() if tracer is not None else nullcontext()
             with thinking:
                 response = writer.invoke(prompt)
         except Exception as exc:
@@ -230,10 +224,12 @@ class PlannerRawEvidence:
     name = "planner.raw_evidence"
 
     def applies(self, ctx: FallbackContext) -> bool:
+        """Any planner run that lacks a final answer."""
         return "final_answer" in ctx.stop_tools
 
     def try_recover(self, ctx: FallbackContext) -> FallbackOutcome | None:
-        draft = planner_fallback_answer(ctx.messages, ctx.goal)
+        """Return the raw researcher reports as the salvaged answer."""
+        draft = planner_fallback_answer(ctx.messages)
         if not draft:
             return None
         return FallbackOutcome(
@@ -248,9 +244,11 @@ class PlannerGiveUp:
     name = "planner.give_up"
 
     def applies(self, ctx: FallbackContext) -> bool:
+        """Final tier: any planner run."""
         return "final_answer" in ctx.stop_tools
 
     def try_recover(self, ctx: FallbackContext) -> FallbackOutcome | None:
+        """No payload — just preserve the stop reason."""
         reason = ctx.stopped_reason or "stopped"
         return FallbackOutcome(
             payload="",
@@ -264,9 +262,11 @@ class ResearcherRawEvidence:
     name = "researcher.raw_evidence"
 
     def applies(self, ctx: FallbackContext) -> bool:
+        """Any researcher-style run (report_findings stop tool)."""
         return "report_findings" in ctx.stop_tools
 
     def try_recover(self, ctx: FallbackContext) -> FallbackOutcome | None:
+        """Compiled evidence dump when some useful tool output exists."""
         notes = "\n\n".join(_tool_chunks(ctx.messages, _USEFUL_TOOLS, 2500, headed=True))
         if not notes:
             return None
@@ -287,9 +287,11 @@ class ResearcherGiveUp:
     name = "researcher.give_up"
 
     def applies(self, ctx: FallbackContext) -> bool:
+        """Final tier: any researcher-style run."""
         return "report_findings" in ctx.stop_tools
 
     def try_recover(self, ctx: FallbackContext) -> FallbackOutcome | None:
+        """Placeholder payload so the planner gets an explicit failure note."""
         reason = ctx.stopped_reason or "stopped"
         return FallbackOutcome(
             payload=f"Researcher stopped without findings ({reason}).",
@@ -305,15 +307,15 @@ FALLBACK_CHAINS: dict[str, list[FallbackTier]] = {
 }
 
 
-def should_fallback_early(role: str, stop_tools: set[str], messages: list[BaseMessage]) -> bool:
+def should_fallback_early(stop_tools: set[str], messages: list[BaseMessage]) -> bool:
     """True when the agent went quiet but already has enough evidence to salvage."""
-    del role
     if "final_answer" in stop_tools:
         return bool(compile_researcher_reports(messages))
     return False
 
 
 def _chain_for(ctx: FallbackContext) -> list[FallbackTier]:
+    """Select the tier chain by role, falling back to the stop-tool signature."""
     if ctx.role in FALLBACK_CHAINS:
         return FALLBACK_CHAINS[ctx.role]
     if "final_answer" in ctx.stop_tools:
@@ -324,6 +326,7 @@ def _chain_for(ctx: FallbackContext) -> list[FallbackTier]:
 
 
 def _synthesis_system() -> str:
+    """The active recipe's synthesis prompt (research default as last resort)."""
     try:
         from workflow.recipes import active_recipe
 
@@ -348,11 +351,3 @@ def run_fallback_chain(ctx: FallbackContext) -> FallbackOutcome | None:
             ctx.tracer.note(f"Fallback [{tier.name}] fired.")
         return outcome
     return None
-
-
-class _null_cm:
-    def __enter__(self):
-        return None
-
-    def __exit__(self, *exc: object) -> bool:
-        return False

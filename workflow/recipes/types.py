@@ -20,7 +20,6 @@ class SpecialistSpec:
         "Use web_search and browse_page as needed, then call report_findings. "
         "report_findings is a tool. Two useful sources is enough."
     )
-    color: str = "magenta"
     batch_name: str = ""
     batch_description: str = ""
     tools: tuple[str, ...] = ("web_search", "browse_page", "report_findings")
@@ -41,6 +40,7 @@ class Recipe:
     role_colors: dict[str, str] = field(default_factory=dict)
 
     def specialist(self, name: str) -> SpecialistSpec:
+        """Find a specialist by name; KeyError lists the recipe's known names."""
         for spec in self.specialists:
             if spec.name == name:
                 return spec

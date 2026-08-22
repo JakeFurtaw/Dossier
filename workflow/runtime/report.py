@@ -21,11 +21,13 @@ class TraceEvent:
     ts: str = ""
 
     def __post_init__(self) -> None:
+        """Stamp creation time when the event was built by hand (replay)."""
         if not self.ts:
             self.ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _md_fence(text: str) -> str:
+    """Neutralize ``` fences so event bodies can't break out of inline markdown."""
     return text.replace("```", "``\\`")
 
 
@@ -42,6 +44,7 @@ def events_to_markdown(
     counters: dict[str, int] | None = None,
     shared_context_md: str = "",
 ) -> str:
+    """Render one run (header, trace, ledger, citation audit, final answer) as markdown."""
     duration = max((ended - started).total_seconds(), 0.0)
     lines = [
         "# Agentic workflow run",
@@ -127,7 +130,7 @@ def events_to_markdown(
     return "\n".join(lines)
 
 
-def write_reports(
+def write_report(
     report_dir: Path,
     stem: str,
     *,
@@ -142,6 +145,7 @@ def write_reports(
     counters: dict[str, int] | None = None,
     shared_context_md: str = "",
 ) -> Path:
+    """Write the run's markdown file under report_dir/stem.md and return its path."""
     report_dir.mkdir(parents=True, exist_ok=True)
     md_path = report_dir / f"{stem}.md"
     md_path.write_text(

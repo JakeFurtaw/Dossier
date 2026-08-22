@@ -28,6 +28,7 @@ _active: ContextVar[Recipe | None] = ContextVar("active_recipe", default=None)
 
 
 def list_recipes() -> tuple[Recipe, ...]:
+    """All registered recipes (used by --list-workflows)."""
     return tuple(RECIPES.values())
 
 
@@ -52,6 +53,7 @@ def active_recipe() -> Recipe:
 
 @contextmanager
 def use_recipe(recipe: Recipe) -> Iterator[Recipe]:
+    """Make ``recipe`` the active recipe for this context (planner tools, evaluator prompts)."""
     token = _active.set(recipe)
     try:
         yield recipe

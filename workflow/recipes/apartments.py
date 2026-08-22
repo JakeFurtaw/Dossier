@@ -249,7 +249,6 @@ LISTING = SpecialistSpec(
         "prefer spawn_agents."
     ),
     user_instructions=LISTING_INSTRUCTIONS,
-    color="yellow",
 )
 
 GEO = SpecialistSpec(
@@ -261,7 +260,6 @@ GEO = SpecialistSpec(
         "and the Dulles Toll Road). For listing + geo together, prefer spawn_agents."
     ),
     user_instructions=GEO_INSTRUCTIONS,
-    color="blue",
 )
 
 AMENITIES = SpecialistSpec(
@@ -273,7 +271,6 @@ AMENITIES = SpecialistSpec(
         "total monthly cost."
     ),
     user_instructions=AMENITIES_INSTRUCTIONS,
-    color="bright_magenta",
 )
 
 RECIPE = Recipe(
